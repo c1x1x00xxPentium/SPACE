@@ -93,6 +93,7 @@ mod native;
 use ingress_lifetime::{Completion, IngressIo, Progress};
 mod runtime_route;
 mod state;
+mod stream_load;
 
 #[cfg(test)]
 use native::{
@@ -175,6 +176,9 @@ fn record_ecw_backend_rpc_latency(
 #[derive(Debug, Clone)]
 pub struct DataPlaneConfig {
     pub listen: String,
+    /// Address of the internal stream-load listener, or `None` to serve none.
+    /// Keep it off the public Service; see [`stream_load`].
+    pub internal_listen: Option<String>,
     pub attach_deadline: Duration,
     pub unauthenticated_upgrade_cap_per_ip: usize,
     pub max_attached_streams: usize,
@@ -189,6 +193,7 @@ impl Default for DataPlaneConfig {
     fn default() -> Self {
         Self {
             listen: DEFAULT_LISTEN.to_string(),
+            internal_listen: None,
             attach_deadline: Duration::from_millis(DEFAULT_ATTACH_DEADLINE_MS),
             unauthenticated_upgrade_cap_per_ip: DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP,
             max_attached_streams: DEFAULT_MAX_ATTACHED_STREAMS,
@@ -325,6 +330,8 @@ pub enum RunDataPlaneError {
     },
     #[error("data-plane HTTP server failed: {0}")]
     Serve(#[source] std::io::Error),
+    #[error("data-plane internal stream-load listener failed: {0}")]
+    InternalServe(#[source] std::io::Error),
 }
 
 pub async fn run(
@@ -362,6 +369,22 @@ pub async fn run(
         upgrade_tasks: upgrade_tasks.clone(),
     };
 
+    // Bind before the public listener so a bad internal address fails startup
+    // instead of leaving a replica that serves traffic but never reports load.
+    let internal_listener = match &config.internal_listen {
+        Some(listen) => Some((
+            tokio::net::TcpListener::bind(listen)
+                .await
+                .map_err(|source| RunDataPlaneError::Bind {
+                    listen: listen.clone(),
+                    source,
+                })?,
+            listen,
+        )),
+        None => None,
+    };
+    let attached_streams = state.attached_streams.clone();
+
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
@@ -370,6 +393,13 @@ pub async fn run(
             source,
         })?;
     tracing::info!(listen = %config.listen, "space-data-plane-svc listening");
+    // The internal listener's lifetime is tied to the process: if it dies, the
+    // replica shuts down and exits non-zero instead of serving traffic while the
+    // cluster controller reads it as unreachable and, after a window, as idle.
+    let internal_task = internal_listener.map(|(internal_listener, listen)| {
+        tracing::info!(listen = %listen, "space-data-plane-svc internal stream-load listener");
+        stream_load::spawn_internal(internal_listener, attached_streams, shutdown_token.clone())
+    });
     let shutdown = {
         let shutdown_token = shutdown_token.clone();
         async move { shutdown_token.cancelled().await }
@@ -386,6 +416,19 @@ pub async fn run(
     shutdown_token.cancel();
     upgrade_tasks.close();
     upgrade_tasks.wait().await;
+
+    if let Some(task) = internal_task {
+        // The supervisor task only awaits a `JoinHandle` and never panics; a
+        // join error here would mean the runtime dropped it.
+        match task.await {
+            Ok(result) => result.map_err(RunDataPlaneError::InternalServe)?,
+            Err(join) => {
+                return Err(RunDataPlaneError::InternalServe(std::io::Error::other(
+                    join.to_string(),
+                )));
+            }
+        }
+    }
 
     Ok(())
 }

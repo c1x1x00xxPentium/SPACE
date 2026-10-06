@@ -137,6 +137,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.btrfs_send_restore_rejects_corrupted_stream",
                 "local.cold_sandbox_eviction_wake_round_trip",
                 "local.concurrent_restore_converges_to_one_execution",
+                "local.data_plane_deletion_cost_tracks_live_streams",
                 "local.ecw_template_build_from_oci_boots",
                 "local.encrypted_resuspend_preserves_cow",
                 "local.forced_drain_evacuates_sandbox",

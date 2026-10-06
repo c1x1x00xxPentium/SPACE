@@ -5184,6 +5184,7 @@ dependencies = [
  "pplx-space-snapshot-store",
  "pplx-space-test-env",
  "prost-types",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "sqlx",

@@ -138,6 +138,21 @@ def _require_ok(result: CommandResult, action: str) -> str:
     return result.stdout
 
 
+def _ready_pod_annotations(pods_json: str, annotation: str) -> dict[str, str | None]:
+    """Ready, non-terminating pods by name, mapped to one annotation's value (None when absent)."""
+    observed: dict[str, str | None] = {}
+    for pod in json.loads(pods_json or "{}").get("items", []):
+        metadata = pod.get("metadata") or {}
+        if metadata.get("deletionTimestamp"):
+            continue
+        conditions = (pod.get("status") or {}).get("conditions") or []
+        if not any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
+            continue
+        value = (metadata.get("annotations") or {}).get(annotation)
+        observed[str(metadata.get("name", ""))] = None if value is None else str(value)
+    return observed
+
+
 def _truthy_default(value: str | None, default: bool) -> bool:
     """Match cluster-controller's accepted boolean environment vocabulary."""
 
@@ -310,6 +325,8 @@ KIND_REDIS_DEPLOYMENT = "space-redis"
 KIND_SEAWEEDFS_DEPLOYMENT = "space-seaweedfs"
 KIND_SEAWEEDFS_POD_SELECTOR = "app.kubernetes.io/name=space-seaweedfs"
 KIND_INTERNAL_API_SELECTOR = "app.kubernetes.io/name=space-internal-api"
+KIND_DATA_PLANE_SELECTOR = "app.kubernetes.io/name=space-data-plane"
+POD_DELETION_COST_ANNOTATION = "controller.kubernetes.io/pod-deletion-cost"
 PENDING_BACKUP_QUEUE_SQL = """\
 SELECT artifact_id::text, artifact_kind FROM node_local_backup_pending
  WHERE sandbox_id = '{sandbox_id}'::uuid ORDER BY artifact_id;
@@ -2987,6 +3004,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         _require_ok(result, "read the sandbox pod")
         return _newest_pod_render(result.stdout)
+
+    def data_plane_deletion_costs(self) -> dict[str, str | None]:
+        result = self.kubectl("get", "pods", "-l", KIND_DATA_PLANE_SELECTOR, "-o", "json", timeout=15)
+        _require_ok(result, "read the data-plane pods")
+        return _ready_pod_annotations(result.stdout, POD_DELETION_COST_ANNOTATION)
 
     def sandbox_pod_count(self) -> int:
         result = self.kubectl("get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15)

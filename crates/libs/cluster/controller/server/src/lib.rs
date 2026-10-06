@@ -10,6 +10,7 @@ use pplx_space_api::controllers::substrate::Substrate;
 use tokio_util::sync::CancellationToken;
 
 mod admin_audit_retention;
+mod data_plane_deletion_cost;
 mod data_plane_session_retention;
 mod drained_node_terminator;
 mod env_config;
