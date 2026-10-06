@@ -811,6 +811,28 @@ fn content_length_precheck_rejects_oversized_uploads() {
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+#[test]
+fn upload_reservation_uses_declared_length_capped_at_the_body_limit() {
+    let limit = E2B_FILE_CONTENT_LIMIT_BYTES as u64;
+    for (content_length, expected) in [
+        (Some("4096".to_string()), 4096),
+        (Some(" 0 ".to_string()), 0),
+        (Some((limit + 1).to_string()), limit),
+        (Some("not-a-number".to_string()), limit),
+        (None, limit),
+    ] {
+        let mut headers = HeaderMap::new();
+        if let Some(content_length) = &content_length {
+            headers.insert(header::CONTENT_LENGTH, content_length.parse().unwrap());
+        }
+        assert_eq!(
+            upload_reservation_bytes(&headers),
+            expected,
+            "{content_length:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn octet_stream_upload_is_spooled_and_written_in_chunks() {
     let sandbox_id = SandboxId::new();

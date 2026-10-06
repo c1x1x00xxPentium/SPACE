@@ -39,7 +39,7 @@ use pplx_space_metrics::data_plane::{
     BackendRpcResult, BackendRpcSurface, ResponseKind, ResponseOrigin, ResponseSurface,
     RouteRepairResult, RouteRepairSurface, ServicePortIngressOpenReason,
     ServicePortIngressOpenResult, ServiceRouteSurface, ServiceRouteTransport,
-    SpaceApiRouteTokenDropReason, SpaceApiRouteTokenRouteSource,
+    SpaceApiRouteTokenDropReason, SpaceApiRouteTokenRouteSource, TooManyRequestsReason,
 };
 use pplx_space_net_gateway_client::proto::{
     ServicePortIngressFrame, ServicePortIngressStart, service_port_ingress_frame,
@@ -88,6 +88,7 @@ use uuid::Uuid;
 mod ecw_connect;
 mod ecw_files;
 mod ecw_process;
+mod http_traffic;
 mod ingress_lifetime;
 mod native;
 use ingress_lifetime::{Completion, IngressIo, Progress};
@@ -213,11 +214,12 @@ struct DataPlaneState {
     route_cache: Arc<RouteCache>,
     ecw_route_repairs: Arc<DashMap<String, tokio::time::Instant>>,
     ecw_process_input_locks: Arc<EcwProcessInputLocks>,
-    ecw_hosts: EcwHostConfig,
+    ecw_hosts: Arc<EcwHostConfig>,
     revocation_check_interval: Duration,
     route_cache_ttl: Duration,
     shutdown_token: CancellationToken,
     upgrade_tasks: TaskTracker,
+    uploads: Arc<http_traffic::UploadTracker>,
 }
 
 #[derive(Clone)]
@@ -353,13 +355,14 @@ pub async fn run(
         route_cache: Arc::new(RouteCache::default()),
         ecw_route_repairs: Arc::new(DashMap::new()),
         ecw_process_input_locks: Arc::new(EcwProcessInputLocks::default()),
-        ecw_hosts: EcwHostConfig::from_env(),
+        ecw_hosts: Arc::new(EcwHostConfig::from_env()),
         revocation_check_interval: config
             .revocation_check_interval
             .max(Duration::from_millis(1)),
         route_cache_ttl: config.route_cache_ttl.max(Duration::from_millis(1)),
         shutdown_token: shutdown_token.clone(),
         upgrade_tasks: upgrade_tasks.clone(),
+        uploads: Arc::default(),
     };
 
     let app = router(state);
@@ -481,7 +484,7 @@ fn native_method_filter(method: NativeHttpMethod) -> MethodFilter {
 }
 
 fn router(state: DataPlaneState) -> Router {
-    let http_span_metadata = DataPlaneHttpSpanMetadata::new(state.ecw_hosts.clone());
+    let http_span_metadata = DataPlaneHttpSpanMetadata::new(Arc::clone(&state.ecw_hosts));
 
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -594,6 +597,10 @@ fn router(state: DataPlaneState) -> Router {
             state.clone(),
             route_ecw_service_port_requests,
         ))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state.ecw_hosts),
+            http_traffic::observe_http_traffic,
+        ))
         .with_state(state)
         .layer(pplx_space_common_svc::http_trace_layer(
             HttpServerMakeSpan::new(http_span_metadata),
@@ -627,10 +634,8 @@ struct DataPlaneHttpSpanMetadata {
 }
 
 impl DataPlaneHttpSpanMetadata {
-    fn new(ecw_hosts: EcwHostConfig) -> Self {
-        Self {
-            ecw_hosts: Arc::new(ecw_hosts),
-        }
+    fn new(ecw_hosts: Arc<EcwHostConfig>) -> Self {
+        Self { ecw_hosts }
     }
 
     fn session_id_from_path<'a>(&self, raw_path: &'a str) -> Option<&'a str> {
@@ -700,7 +705,9 @@ async fn ecw_service_proxy(
     let _waiter = pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(
         Some(target.sandbox_id),
     )
-    .map_err(|_| EcwProxyError::too_many_attached_streams())?;
+    .map_err(|_| {
+        EcwProxyError::too_many_attached_streams(TooManyRequestsReason::IngressPreparation)
+    })?;
     let deadline = tokio::time::Instant::now()
         + pplx_space_common_svc::ingress_admission::preparation_timeout();
     let request_headers = request.headers().clone();
@@ -858,6 +865,7 @@ async fn ecw_service_ingress_proxy_with_io(
         }
     };
     record_ecw_sandbox_proxy_response(response.status());
+    mark_sandbox_service_response(&mut response);
 
     let upstream_upgrade =
         if downstream_upgrade.is_some() && response.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -1352,6 +1360,14 @@ async fn route_ecw_service_port_requests(
     } else {
         next.run(request).await
     }
+}
+
+/// Attributes a relayed sandbox response, so a 429 the sandbox's own service
+/// returned is not counted as a data-plane rejection.
+fn mark_sandbox_service_response<B>(response: &mut axum::http::Response<B>) {
+    response
+        .extensions_mut()
+        .insert(TooManyRequestsReason::SandboxService);
 }
 
 fn should_proxy_ecw_service_port_request(ecw_hosts: &EcwHostConfig, headers: &HeaderMap) -> bool {

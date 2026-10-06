@@ -1,0 +1,23 @@
+flowchart TB
+  client([Client]):::ext
+  obs["observe_http_traffic (wraps every data-plane route)<br/>classify route_class · count request + response body frames"]:::new
+  sp["route_ecw_service_port_requests"]:::old
+  h["Handlers: filesystem · process · native sessions · service proxy"]:::old
+  wf["ECW POST /files<br/>resolve route → UploadTracker.begin(org_id, sandbox_id)"]:::new
+  sandbox([Sandbox service]):::ext
+
+  client -- "request / response bodies" --> obs
+  obs --> sp --> h
+  sp --> wf
+  h -. "relayed responses marked sandbox_service" .-> sandbox
+
+  obs ==> m1["data_plane.http.bytes{direction, route_class}<br/>flush every 1 MiB and on drop"]:::metric
+  obs ==> m2["data_plane.http.too_many_requests{route_class, reason}<br/>reason from response extension, else unclassified"]:::metric
+  wf ==> m3["data_plane.upload.in_flight / in_flight_bytes<br/>changed and emitted under one lock"]:::metric
+  wf ==> l1["log space.data_plane.upload<br/>org_id · sandbox_id · outcome · bytes received / reserved · duration"]:::log
+
+  classDef ext fill:#eeeeee,stroke:#777,color:#222
+  classDef old fill:#dbe9f6,stroke:#4a78a8,color:#123
+  classDef new fill:#d5f0d5,stroke:#3c8a3c,color:#123
+  classDef metric fill:#fff2cc,stroke:#b8962e,color:#332
+  classDef log fill:#f6dbe9,stroke:#a84a78,color:#312

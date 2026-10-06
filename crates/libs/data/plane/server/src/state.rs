@@ -786,6 +786,9 @@ pub(super) struct EcwResolvedRoute {
     pub(super) cache_epoch: u64,
     pub(super) origin: EcwRouteOrigin,
     pub(super) sandbox_id: SandboxId,
+    /// Owning org, for upload attribution. `None` when the resolve response
+    /// carries no parseable org; nothing routes or authorizes on it.
+    pub(super) org_id: Option<OrgId>,
     pub(super) template_id: Option<String>,
     pub(super) route_generation: u64,
     pub(super) current_node_id: NodeId,
@@ -1472,6 +1475,7 @@ pub(super) struct EcwProxyError {
     pub(super) origin: ResponseOrigin,
     pub(super) kind: ResponseKind,
     backend_status: Option<tonic::Status>,
+    too_many_requests_reason: Option<TooManyRequestsReason>,
 }
 
 impl EcwProxyError {
@@ -1555,13 +1559,14 @@ impl EcwProxyError {
         .without_runtime_access_classification()
     }
 
-    pub(super) fn too_many_attached_streams() -> Self {
+    pub(super) fn too_many_attached_streams(reason: TooManyRequestsReason) -> Self {
         Self::new(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many attached streams",
             ResponseOrigin::DataPlane,
             ResponseKind::Admission,
         )
+        .with_too_many_requests_reason(reason)
     }
 
     pub(super) fn internal(message: impl Into<String>) -> Self {
@@ -1612,6 +1617,7 @@ impl EcwProxyError {
             origin,
             kind,
             backend_status: None,
+            too_many_requests_reason: None,
         }
     }
 
@@ -1642,6 +1648,12 @@ impl EcwProxyError {
 
     pub(super) fn with_backend_status(mut self, status: tonic::Status) -> Self {
         self.backend_status = Some(status);
+        self
+    }
+
+    /// Names the limit behind a 429 for `data_plane.http.too_many_requests`.
+    pub(super) fn with_too_many_requests_reason(mut self, reason: TooManyRequestsReason) -> Self {
+        self.too_many_requests_reason = Some(reason);
         self
     }
 
@@ -1695,6 +1707,9 @@ impl IntoResponse for EcwProxyError {
                 header::HeaderValue::from_str(&retry_after.as_secs().max(1).to_string())
         {
             response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        if let Some(reason) = self.too_many_requests_reason {
+            response.extensions_mut().insert(reason);
         }
         response
     }
@@ -1914,6 +1929,14 @@ impl AttachedStreamLimit {
             Self::Total => "too_many_attached_streams",
             Self::Org => "too_many_attached_streams_per_org",
             Self::Sandbox => "too_many_attached_streams_per_sandbox",
+        }
+    }
+
+    pub(super) const fn too_many_requests_reason(self) -> TooManyRequestsReason {
+        match self {
+            Self::Total => TooManyRequestsReason::AttachedStreams,
+            Self::Org => TooManyRequestsReason::AttachedStreamsPerOrg,
+            Self::Sandbox => TooManyRequestsReason::AttachedStreamsPerSandbox,
         }
     }
 }

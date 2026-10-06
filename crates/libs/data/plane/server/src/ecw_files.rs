@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::{
-    Json,
+    Extension, Json,
     body::{Body, Bytes, to_bytes},
     extract::{Query, State},
     http::{HeaderMap, StatusCode, header},
@@ -40,6 +40,7 @@ use super::{
     ecw_connect, node_api_request_with_route_token_state, resolve_ecw_envd_route,
 };
 use crate::ecw_process::EmptyUnaryConnectResponseE2b;
+use crate::http_traffic::RequestBodyBytes;
 use crate::runtime_route::{
     EcwRouteAttemptError, bounded_ecw_route_transfer, bounded_node_api_unary,
     retryable_bounded_node_api_unary,
@@ -269,19 +270,58 @@ pub(super) async fn read_file(
 
 pub(super) async fn write_file(
     State(state): State<DataPlaneState>,
+    request_bytes: Option<Extension<RequestBodyBytes>>,
     headers: HeaderMap,
     Query(query): Query<FileWritePathQueryE2b>,
     body: Body,
 ) -> Result<Json<Vec<FileWriteInfoE2b>>, EcwProxyError> {
     let route = resolve_ecw_envd_route(&state, &headers).await?;
+    // Tracking starts once the route resolves, so unauthenticated or unroutable
+    // requests never enter the sizing gauges and every record names its org.
+    // Uploads the handler then rejects (oversized, malformed) stay tracked: an
+    // admission limit checked before the body is read would see them too, and
+    // their record's `http_status` separates them.
+    let upload = state.uploads.begin(
+        upload_reservation_bytes(&headers),
+        route.sandbox_id,
+        route.org_id,
+        request_bytes.map(|Extension(request_bytes)| request_bytes),
+    );
+    let result = write_file_tracked(&state, route, &headers, query, body).await;
+    upload.finish(match &result {
+        Ok(_) => StatusCode::OK,
+        Err(error) => error.status,
+    });
+    result
+}
+
+/// What an upload admission limit would reserve for this request: the declared
+/// `Content-Length`, capped at the body limit, or the whole limit when the
+/// client declares none or an unparseable one.
+fn upload_reservation_bytes(headers: &HeaderMap) -> u64 {
+    let limit = E2B_FILE_CONTENT_LIMIT_BYTES as u64;
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(limit, |content_length| content_length.min(limit))
+}
+
+async fn write_file_tracked(
+    state: &DataPlaneState,
+    route: EcwResolvedRoute,
+    headers: &HeaderMap,
+    query: FileWritePathQueryE2b,
+    body: Body,
+) -> Result<Json<Vec<FileWriteInfoE2b>>, EcwProxyError> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
-    let user = extract_write_user(query.username.as_deref(), &headers)?;
+    let user = extract_write_user(query.username.as_deref(), headers)?;
     if is_octet_stream_content_type(content_type) {
         reject_oversized_content_length(
-            &headers,
+            headers,
             E2B_FILE_CONTENT_LIMIT_BYTES,
             file_too_large_error,
         )?;
@@ -294,18 +334,18 @@ pub(super) async fn write_file(
         // Create the parent before reading the body, so a destination whose
         // parent can't be created fails without spooling the upload. Other
         // write failures still surface after spooling.
-        let route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
+        let route = ensure_parent_dir(state, route, &path, user.clone()).await?;
         let mut spool = SpoolFiles::default();
         let upload = spool_body_upload(body, &mut spool).await?;
-        spaced_write_spooled(&state, route, path.clone(), &upload, user).await?;
+        spaced_write_spooled(state, route, path.clone(), &upload, user).await?;
         return Ok(Json(vec![file_write_info(path)]));
     }
 
     if is_json_content_type(content_type) {
-        let request = read_json_file_write_request(&headers, body).await?;
+        let request = read_json_file_write_request(headers, body).await?;
         let path = e2b_request_root(&request.path, user.as_ref())?;
         spaced_write_bytes(
-            &state,
+            state,
             route,
             path.clone(),
             file_write_content_to_bytes(request.content)?,
@@ -317,7 +357,7 @@ pub(super) async fn write_file(
 
     if content_type.starts_with("multipart/form-data") {
         reject_oversized_content_length(
-            &headers,
+            headers,
             E2B_FILE_CONTENT_LIMIT_BYTES,
             file_too_large_error,
         )?;
@@ -339,9 +379,8 @@ pub(super) async fn write_file(
         let mut written = Vec::with_capacity(writes.len());
         let mut route = route;
         for (path, upload) in writes {
-            route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
-            route =
-                spaced_write_spooled(&state, route, path.clone(), &upload, user.clone()).await?;
+            route = ensure_parent_dir(state, route, &path, user.clone()).await?;
+            route = spaced_write_spooled(state, route, path.clone(), &upload, user.clone()).await?;
             written.push(file_write_info(path));
         }
         return Ok(Json(written));

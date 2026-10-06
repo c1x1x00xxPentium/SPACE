@@ -285,6 +285,15 @@ async fn refusals_before_start_are_retryable_with_retry_after() {
         let error = StreamBridgeError::BackendStatus(status);
         let response = process_stream_start_http_error(&error);
         assert_eq!(response.status(), expected_status, "{code:?}");
+        assert_eq!(
+            response
+                .extensions()
+                .get::<TooManyRequestsReason>()
+                .copied(),
+            (expected_status == StatusCode::TOO_MANY_REQUESTS)
+                .then_some(TooManyRequestsReason::SandboxAtCapacity),
+            "{code:?}",
+        );
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "2");
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();

@@ -207,14 +207,7 @@ pub(super) async fn session_events(
                 session_id.kind().as_str(),
                 limit.metric_label(),
             );
-            return data_plane_http_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                DataPlaneHttpErrorCode::RateLimited,
-                "too many attached streams",
-                true,
-                ResponseOrigin::DataPlane,
-                ResponseKind::Admission,
-            );
+            return too_many_attached_streams_response(limit);
         }
     };
     let stream_state = match attached.kind {
@@ -798,14 +791,7 @@ pub(super) async fn proxy_session(
             Ok(permit) => Some(permit),
             Err(limit) => {
                 pplx_space_metrics::data_plane::attach(kind, limit.metric_label());
-                return Ok(data_plane_http_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    DataPlaneHttpErrorCode::RateLimited,
-                    "too many attached streams",
-                    true,
-                    ResponseOrigin::DataPlane,
-                    ResponseKind::Admission,
-                ));
+                return Ok(too_many_attached_streams_response(limit));
             }
         }
     } else {
@@ -898,6 +884,7 @@ pub(super) async fn proxy_session(
     }
 
     record_native_proxied_response(response.status());
+    mark_sandbox_service_response(&mut response);
 
     let response = response.map(|body| completion.body(Body::new(body)));
     if let (Some(downstream_upgrade), Some(upstream_upgrade), Some(stream_permit)) =
@@ -1694,6 +1681,11 @@ fn backend_refusal_http_error(error: &StreamBridgeError) -> Option<Response> {
         ResponseKind::Admission,
     );
     insert_retry_after(&mut response, pplx_space_common_grpc::retry_after(status));
+    if http == StatusCode::TOO_MANY_REQUESTS {
+        response
+            .extensions_mut()
+            .insert(TooManyRequestsReason::SandboxAtCapacity);
+    }
     Some(response)
 }
 
