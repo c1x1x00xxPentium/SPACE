@@ -93,34 +93,37 @@ async fn internal_listener_serves_over_tcp_and_stops_cleanly_on_shutdown() {
     assert!(response.contains("\"active_streams\":0"), "{response}");
 
     shutdown.cancel();
-    task.await
-        .expect("internal listener task")
-        .expect("a requested shutdown is not an error");
-}
-
-#[tokio::test]
-async fn a_panicking_serve_task_shuts_the_replica_down() {
-    let shutdown = CancellationToken::new();
-    let serve = tokio::spawn(async { panic!("serve task panicked") });
-
-    let result = supervise_internal(serve, shutdown.clone()).await;
-
-    assert!(result.is_err(), "a panic is not a clean stop");
-    assert!(
-        shutdown.is_cancelled(),
-        "the supervisor stops the public listener too"
+    assert_eq!(
+        task.await.expect("internal listener task"),
+        InternalListenerEnd::Shutdown
     );
 }
 
 #[tokio::test]
-async fn a_serve_task_that_returns_before_shutdown_shuts_the_replica_down() {
+async fn a_panicking_serve_task_is_logged_and_leaves_the_replica_serving() {
+    let shutdown = CancellationToken::new();
+    let serve = tokio::spawn(async { panic!("serve task panicked") });
+
+    assert_eq!(
+        supervise_internal(serve, shutdown.clone()).await,
+        InternalListenerEnd::Early
+    );
+    assert!(
+        !shutdown.is_cancelled(),
+        "shutting the replica down would cut every stream it holds"
+    );
+}
+
+#[tokio::test]
+async fn a_serve_task_that_returns_before_shutdown_is_an_early_end() {
     let shutdown = CancellationToken::new();
     let serve = tokio::spawn(async { Ok(()) });
 
-    let result = supervise_internal(serve, shutdown.clone()).await;
-
-    assert!(result.is_err());
-    assert!(shutdown.is_cancelled());
+    assert_eq!(
+        supervise_internal(serve, shutdown.clone()).await,
+        InternalListenerEnd::Early
+    );
+    assert!(!shutdown.is_cancelled());
 }
 
 #[tokio::test]
@@ -129,7 +132,8 @@ async fn a_serve_task_that_stops_after_shutdown_is_clean() {
     shutdown.cancel();
     let serve = tokio::spawn(async { Ok(()) });
 
-    supervise_internal(serve, shutdown)
-        .await
-        .expect("a requested shutdown is not an error");
+    assert_eq!(
+        supervise_internal(serve, shutdown).await,
+        InternalListenerEnd::Shutdown
+    );
 }

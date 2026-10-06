@@ -9,10 +9,12 @@ what only a cluster shows is the whole chain: the data plane's internal
 listener answering on the pod IP, the controller's reflector seeing the pod,
 its RBAC allowing the patch, and the annotation following a real stream.
 
-The writer ticks every 10 s and writes a pod at most once per 30 s, so a
-bucket change lands within about 40 s. Smoke scenarios run one at a time and
-clean up their sandboxes, so once this scenario's own stream closes, the pod
-has no attached streams and the annotation settles back to cost 0.
+The writer ticks every 10 s. A raise lands on the next tick; a lowering waits
+until 30 s after the pod's last write, so it lands within about 40 s. The
+scenario needs the bench's data plane otherwise idle: earlier scenarios clean
+up their sandboxes, and a concurrent smoke run on the same bench would make it
+fail. When a settle fails, the evidence includes each pod's own attached-stream
+count, so a leftover stream reads as that rather than as a writer fault.
 """
 
 from __future__ import annotations

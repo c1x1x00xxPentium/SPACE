@@ -330,8 +330,6 @@ pub enum RunDataPlaneError {
     },
     #[error("data-plane HTTP server failed: {0}")]
     Serve(#[source] std::io::Error),
-    #[error("data-plane internal stream-load listener failed: {0}")]
-    InternalServe(#[source] std::io::Error),
 }
 
 pub async fn run(
@@ -393,9 +391,9 @@ pub async fn run(
             source,
         })?;
     tracing::info!(listen = %config.listen, "space-data-plane-svc listening");
-    // The internal listener's lifetime is tied to the process: if it dies, the
-    // replica shuts down and exits non-zero instead of serving traffic while the
-    // cluster controller can't read its load.
+    // A dead internal listener is logged, not fatal: the cluster controller then
+    // ranks this replica as busy, which only errs toward removing it last, while
+    // shutting it down would cut every stream it holds.
     let internal_task = internal_listener.map(|(internal_listener, listen)| {
         tracing::info!(listen = %listen, "space-data-plane-svc internal stream-load listener");
         stream_load::spawn_internal(internal_listener, attached_streams, shutdown_token.clone())
@@ -417,17 +415,10 @@ pub async fn run(
     upgrade_tasks.close();
     upgrade_tasks.wait().await;
 
-    if let Some(task) = internal_task {
-        // The supervisor task only awaits a `JoinHandle` and never panics; a
-        // join error here would mean the runtime dropped it.
-        match task.await {
-            Ok(result) => result.map_err(RunDataPlaneError::InternalServe)?,
-            Err(join) => {
-                return Err(RunDataPlaneError::InternalServe(std::io::Error::other(
-                    join.to_string(),
-                )));
-            }
-        }
+    if let Some(task) = internal_task
+        && let Err(error) = task.await
+    {
+        tracing::warn!(%error, "data-plane internal stream-load supervisor task failed");
     }
 
     Ok(())

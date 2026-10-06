@@ -183,19 +183,38 @@ fn decide_skips_writes_that_would_not_change_the_ranking() {
 }
 
 #[test]
-fn decide_rate_limits_each_pod_to_one_write_per_interval() {
+fn decide_rate_limits_lowering_a_pod_to_one_write_per_interval() {
     let start = Instant::now();
-    let changed = |elapsed| {
+    let lowered = |elapsed| {
         decide(
-            Some("10"),
-            DeletionCost::High,
+            Some("1000"),
+            DeletionCost::Low,
             Some(start),
             start + elapsed,
             INTERVAL,
         )
     };
-    assert_eq!(changed(Duration::from_secs(29)), WriteDecision::RateLimited);
-    assert_eq!(changed(INTERVAL), WriteDecision::Write(DeletionCost::High));
+    assert_eq!(lowered(Duration::from_secs(29)), WriteDecision::RateLimited);
+    assert_eq!(lowered(INTERVAL), WriteDecision::Write(DeletionCost::Low));
+}
+
+#[test]
+fn decide_raises_a_pod_at_once_whenever_it_was_last_written() {
+    let start = Instant::now();
+    let just_after = start + Duration::from_secs(1);
+    for (current, desired) in [
+        (Some("0"), DeletionCost::High),
+        (None, DeletionCost::Low),
+        (Some("10"), DeletionCost::Medium),
+        (Some("not-a-cost"), DeletionCost::Idle),
+    ] {
+        assert_eq!(
+            decide(current, desired, Some(start), just_after, INTERVAL),
+            WriteDecision::Write(desired),
+            "{current:?} -> {desired}: a busy pod must not keep reading low, and a \
+             foreign value is replaced at once"
+        );
+    }
 }
 
 #[tokio::test]
@@ -234,32 +253,51 @@ async fn writes_only_pods_whose_bucket_changed_and_whose_load_is_known() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_pod_whose_bucket_keeps_moving_is_written_at_most_once_per_interval() {
-    let backend = FakeBackend::with_pods(vec![(pod("dp", None), FakeLoad::Active(5))]);
+async fn a_pod_whose_load_drops_is_lowered_at_most_once_per_interval() {
+    let backend = FakeBackend::with_pods(vec![(pod("dp", None), FakeLoad::Active(500))]);
     let config = config();
     let mut history = WriteHistory::default();
 
     reconcile_once(&backend, &config, &mut history).await;
-    assert_eq!(backend.take_writes(), vec![write("dp", DeletionCost::Low)]);
+    assert_eq!(backend.take_writes(), vec![write("dp", DeletionCost::High)]);
 
-    backend.set_load("dp", FakeLoad::Active(500));
+    backend.set_load("dp", FakeLoad::Active(5));
     tokio::time::advance(Duration::from_secs(10)).await;
     reconcile_once(&backend, &config, &mut history).await;
     tokio::time::advance(Duration::from_secs(10)).await;
     reconcile_once(&backend, &config, &mut history).await;
     assert!(
         backend.take_writes().is_empty(),
-        "the bucket changed 10s and 20s after the last write"
+        "the bucket dropped 10s and 20s after the last write"
     );
 
     tokio::time::advance(Duration::from_secs(10)).await;
     reconcile_once(&backend, &config, &mut history).await;
-    assert_eq!(backend.take_writes(), vec![write("dp", DeletionCost::High)]);
+    assert_eq!(backend.take_writes(), vec![write("dp", DeletionCost::Low)]);
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_failed_write_still_counts_against_the_interval() {
-    let backend = FakeBackend::with_pods(vec![(pod("dp", None), FakeLoad::Active(5))]);
+async fn a_pod_that_takes_streams_right_after_a_lowering_is_raised_on_the_next_tick() {
+    let backend = FakeBackend::with_pods(vec![(pod("dp", Some("1000")), FakeLoad::Active(0))]);
+    let config = config();
+    let mut history = WriteHistory::default();
+
+    reconcile_once(&backend, &config, &mut history).await;
+    assert_eq!(backend.take_writes(), vec![write("dp", DeletionCost::Idle)]);
+
+    backend.set_load("dp", FakeLoad::Active(150));
+    tokio::time::advance(config.tick).await;
+    reconcile_once(&backend, &config, &mut history).await;
+    assert_eq!(
+        backend.take_writes(),
+        vec![write("dp", DeletionCost::High)],
+        "a pod that reads 0 while holding 150 streams is the first a scale-in removes"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_lowering_still_counts_against_the_interval() {
+    let backend = FakeBackend::with_pods(vec![(pod("dp", Some("1000")), FakeLoad::Active(5))]);
     *backend.fail_writes.lock().unwrap() = true;
     let config = config();
     let mut history = WriteHistory::default();
@@ -406,18 +444,18 @@ async fn a_long_lived_stream_keeps_its_pod_ranked_busy() {
 
 #[tokio::test(start_paused = true)]
 async fn a_readiness_flap_keeps_the_write_interval() {
-    let backend = FakeBackend::with_pods(vec![(pod("dp", None), FakeLoad::Active(5))]);
+    let backend = FakeBackend::with_pods(vec![(pod("dp", None), FakeLoad::Active(500))]);
     let config = config();
     let mut history = WriteHistory::default();
 
     reconcile_once(&backend, &config, &mut history).await;
-    assert_eq!(backend.take_writes(), vec![write("dp", DeletionCost::Low)]);
+    assert_eq!(backend.take_writes(), vec![write("dp", DeletionCost::High)]);
 
     backend.set_ready("dp", false);
     tokio::time::advance(Duration::from_secs(10)).await;
     reconcile_once(&backend, &config, &mut history).await;
     backend.set_ready("dp", true);
-    backend.set_load("dp", FakeLoad::Active(500));
+    backend.set_load("dp", FakeLoad::Active(5));
     tokio::time::advance(Duration::from_secs(10)).await;
     reconcile_once(&backend, &config, &mut history).await;
 

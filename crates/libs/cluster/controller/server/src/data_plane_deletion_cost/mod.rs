@@ -18,26 +18,32 @@
 //! The data plane does not write its own annotation: that would grant the
 //! internet-facing pod `patch` on pods in its namespace. This process is
 //! leader-elected and needs `list`, `watch` and `patch` on pods in the
-//! data-plane namespace. RBAC cannot narrow that grant to one annotation or one
-//! label; a deployment that wants it narrower can add a
-//! ValidatingAdmissionPolicy limiting this service account's pod updates to
-//! that annotation.
+//! data-plane namespace. RBAC cannot narrow that grant to one annotation: pod
+//! `patch` also allows changing labels and container images. A deployment that
+//! wants it narrower can add a ValidatingAdmissionPolicy limiting this service
+//! account's pod updates to that annotation.
 //!
 //! Properties worth keeping if this is refactored:
 //!
 //! - **Bucketed, rate-limited writes.** The value is one of four buckets and is
-//!   written only when the bucket changes, and at most once per
-//!   [`ReconcilerConfig::min_write_interval`] per pod. Pod updates fan out to
+//!   written only when the bucket changes. Lowering a pod's cost waits at least
+//!   [`ReconcilerConfig::min_write_interval`] since its last write; raising it
+//!   doesn't, because every moment a busy pod still reads low is a moment a
+//!   scale-in removes it first. A raise always follows a lowering, so a pod is
+//!   still written at most about twice per interval. Pod updates fan out to
 //!   every watcher of the namespace, so a raw count would be a write per stream.
 //! - **Unknown load ranks as busy.** One failed or timed-out probe writes
 //!   nothing; after [`ReconcilerConfig::unknown_as_busy_after`] consecutive
 //!   failures the pod is written the top bucket. Keeping the last value would
 //!   keep a stale low one too: an idle pod whose probes start failing while it
 //!   takes streams would stay first in line. Ranking unknown as busy only ever
-//!   errs toward removing that pod last. Such pods count in the `unknown`
-//!   bucket of `data_plane_deletion_cost.pods`, and the data plane exits if its
-//!   internal listener stops, so a Ready pod that stays unreadable is a network
-//!   or overload problem worth alerting on.
+//!   errs toward removing that pod last. That holds per pod; if the controller
+//!   loses most of the fleet at once, those pods tie at the top and any pod it
+//!   can still read moves to the front, which is what the `unknown` alert is
+//!   for. Such pods count in the `unknown` bucket of
+//!   `data_plane_deletion_cost.pods`; a Ready pod that stays unreadable is a
+//!   dead internal listener (the data plane logs it and keeps serving), a
+//!   network problem, or overload, and worth alerting on.
 //! - **Disabling stops the writes, not the ranking.** Turning the reconciler off
 //!   leaves each pod's last value in place until the pod is replaced.
 //! - **Best effort.** This orders deletion; it guarantees nothing. When every
@@ -87,8 +93,9 @@ const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// the tick, and `MissedTickBehavior::Delay` pushes the next one back rather
 /// than stacking them. Healthy probes answer in milliseconds.
 const DEFAULT_CONCURRENCY: usize = 8;
-/// Consecutive failed probes before a pod ranks as busy: about 30s at the
-/// default tick, so one dropped request changes nothing.
+/// Consecutive failed probes before a pod ranks as busy. At the default 10s
+/// tick the third failure comes 20s after the first (30s after the last good
+/// probe), so one dropped request changes nothing.
 const DEFAULT_UNKNOWN_AS_BUSY_AFTER: u32 = 3;
 
 /// One of the four values the writer publishes.
@@ -111,6 +118,12 @@ impl DeletionCost {
             10..=99 => Self::Medium,
             _ => Self::High,
         }
+    }
+
+    /// Parse an annotation value this writer could have written; `None` for
+    /// anything else (a hand-set value, an older writer's).
+    fn from_annotation(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|cost| cost.as_str() == value)
     }
 
     /// The annotation value: the cost the ReplicaSet controller ranks by.
@@ -175,10 +188,10 @@ pub struct ReconcilerConfig {
     pub namespace: String,
     pub pod_selector: String,
     pub tick: Duration,
-    /// Minimum time between two writes to the same pod, measured from the
-    /// start of one write attempt to the tick that plans the next. With a 10s
-    /// tick a pod whose bucket keeps changing is written at least 30s apart,
-    /// usually 30–40s; slow ticks stretch it further.
+    /// Minimum time before a pod's cost is lowered again, measured from the
+    /// start of its last write attempt to the tick that plans the lowering.
+    /// With a 10s tick that is at least 30s, usually 30–40s; slow ticks stretch
+    /// it further. Raises aren't held back.
     pub min_write_interval: Duration,
     /// Consecutive failed probes after which a pod's load is treated as the top
     /// bucket. See the module docs for why unknown ranks as busy.
@@ -241,6 +254,8 @@ enum WriteDecision {
 
 /// Decide one pod's write. An absent annotation already means cost 0 to the
 /// ReplicaSet controller, so an idle pod with no annotation needs no write.
+/// Only a lowering is rate-limited: a raise, or a value this writer doesn't
+/// recognize, is written at once.
 fn decide(
     current: Option<&str>,
     desired: DeletionCost,
@@ -255,6 +270,14 @@ fn decide(
     if matches {
         return WriteDecision::Unchanged;
     }
+    let current_cost = match current {
+        Some(value) => DeletionCost::from_annotation(value),
+        None => Some(DeletionCost::Idle),
+    };
+    let lowering = current_cost.is_some_and(|current| desired < current);
+    if !lowering {
+        return WriteDecision::Write(desired);
+    }
     match last_write {
         Some(at) if now.saturating_duration_since(at) < min_write_interval => {
             WriteDecision::RateLimited
@@ -266,7 +289,8 @@ fn decide(
 /// Per-pod-UID memory across ticks: the last write attempt, and how many
 /// probes in a row have failed. Entries are dropped once the pod is gone or
 /// terminating, not when it is merely NotReady, so both are bounded by the
-/// live Deployment size and a readiness flap resets neither.
+/// selector's non-terminating pods (the Deployment plus any Failed pods not yet
+/// garbage-collected) and a readiness flap resets neither.
 #[derive(Debug, Default)]
 struct WriteHistory {
     last_write: HashMap<String, Instant>,
@@ -402,22 +426,16 @@ async fn reconcile_once<B: DeletionCostBackend>(
             Err(failure) => {
                 unknown += 1;
                 let failures = history.probe_failed(&pod.uid);
-                // Logged at the start of a run and when it tips into busy, so
-                // an unreachable pod is two lines, not one every tick.
+                // Logged at the start of a run; the switch to busy is logged
+                // with its write below. An unreachable pod is two lines, not
+                // one every tick.
                 if failures == 1 {
                     tracing::warn!(
                         pod = %pod.name,
                         failure = %failure,
-                        "data-plane stream-load probe failed; keeping the pod's last \
-                         deletion cost for now"
-                    );
-                } else if failures == config.unknown_as_busy_after {
-                    tracing::warn!(
-                        pod = %pod.name,
-                        failures,
-                        failure = %failure,
-                        "data-plane stream-load probe keeps failing; ranking the pod as \
-                         busy until a probe succeeds"
+                        unknown_as_busy_after = config.unknown_as_busy_after,
+                        "data-plane stream-load probe failed; the pod ranks as busy once \
+                         this many probes in a row have failed"
                     );
                 } else {
                     tracing::debug!(
@@ -439,7 +457,15 @@ async fn reconcile_once<B: DeletionCostBackend>(
                 ) {
                     WriteDecision::Unchanged => unchanged += 1,
                     WriteDecision::RateLimited => rate_limited += 1,
-                    WriteDecision::Write(desired) => writes.push((pod, desired)),
+                    WriteDecision::Write(desired) => {
+                        tracing::warn!(
+                            pod = %pod.name,
+                            failures,
+                            "data-plane stream-load probe keeps failing; ranking the pod \
+                             as busy until a probe succeeds"
+                        );
+                        writes.push((pod, desired));
+                    }
                 }
                 continue;
             }
@@ -467,8 +493,9 @@ async fn reconcile_once<B: DeletionCostBackend>(
     pplx_space_metrics::data_plane_deletion_cost::writes(WriteOutcome::Unchanged, unchanged);
     pplx_space_metrics::data_plane_deletion_cost::writes(WriteOutcome::RateLimited, rate_limited);
 
-    // An attempt counts against the interval whether or not it lands, so a pod
-    // whose patch keeps failing is retried at the write rate, not every tick.
+    // An attempt counts against the interval whether or not it lands, so a
+    // lowering whose patch keeps failing is retried at the write rate; a raise
+    // is retried every tick until it lands.
     // Stamped when the attempt starts, not when it was queued, so a slow
     // apiserver that holds writes behind the concurrency limit can't shorten
     // a pod's interval.

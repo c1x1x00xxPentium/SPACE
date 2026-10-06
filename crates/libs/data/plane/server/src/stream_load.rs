@@ -37,21 +37,19 @@ async fn stream_load_handler(
 
 /// Serve the internal router on its own task until `shutdown` fires.
 ///
-/// The listener's lifetime is tied to the process: if the serve task ends while
-/// `shutdown` is still live, the supervisor cancels `shutdown` (so the public
-/// listener drains and the process exits) and returns an error for `run` to
-/// surface. A replica that kept serving without its load report would have its
-/// ordering signal frozen and then guessed by the cluster controller.
-///
-/// With graceful shutdown, `axum::serve` neither errors nor returns before the
-/// signal fires (it retries failed accepts), so in practice the early end this
-/// guards against is a panic in the serve task. The supervisor watches the
-/// task's `JoinHandle` rather than the serve result so a panic is caught too.
+/// If the serve task ends before `shutdown` (with graceful shutdown,
+/// `axum::serve` retries failed accepts and only returns once the signal
+/// fires, so in practice that means a panic), the supervisor logs it and the
+/// replica keeps serving. The cluster controller then can't read this
+/// replica's load and ranks it as busy after a few failed probes, which only
+/// errs toward removing it last; shutting the replica down instead would cut
+/// every stream it holds. The supervisor watches the task's `JoinHandle` rather
+/// than the serve result so a panic is caught too.
 pub(crate) fn spawn_internal(
     listener: tokio::net::TcpListener,
     limiter: std::sync::Arc<AttachedStreamLimiter>,
     shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<std::io::Result<()>> {
+) -> tokio::task::JoinHandle<InternalListenerEnd> {
     let stopped = shutdown.clone();
     let serve = tokio::spawn(async move {
         axum::serve(listener, internal_router(limiter))
@@ -61,31 +59,38 @@ pub(crate) fn spawn_internal(
     tokio::spawn(supervise_internal(serve, shutdown))
 }
 
-/// Turn the serve task's end into the internal listener's outcome. Only a clean
-/// stop after `shutdown` fired is `Ok`; anything else cancels `shutdown`.
+/// How the internal listener's serve task ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InternalListenerEnd {
+    /// Stopped cleanly because `shutdown` fired.
+    Shutdown,
+    /// Ended on its own: returned early, errored, or panicked. Logged; the
+    /// replica keeps serving.
+    Early,
+}
+
+/// Classify and log the serve task's end. Never touches `shutdown`.
 pub(crate) async fn supervise_internal(
     serve: tokio::task::JoinHandle<std::io::Result<()>>,
     shutdown: CancellationToken,
-) -> std::io::Result<()> {
+) -> InternalListenerEnd {
     let ended = serve.await;
     if shutdown.is_cancelled()
         && let Ok(Ok(())) = ended
     {
-        return Ok(());
+        return InternalListenerEnd::Shutdown;
     }
     let error = match ended {
-        Ok(Ok(())) => {
-            std::io::Error::other("internal stream-load listener stopped before shutdown")
-        }
-        Ok(Err(error)) => error,
-        Err(join) => std::io::Error::other(format!("internal stream-load listener task: {join}")),
+        Ok(Ok(())) => "stopped before shutdown".to_string(),
+        Ok(Err(error)) => error.to_string(),
+        Err(join) => join.to_string(),
     };
     tracing::error!(
         %error,
-        "data-plane internal stream-load listener ended; shutting the replica down"
+        "data-plane internal stream-load listener ended; this replica keeps serving \
+         and the cluster controller will rank it as busy until it restarts"
     );
-    shutdown.cancel();
-    Err(error)
+    InternalListenerEnd::Early
 }
 
 #[cfg(test)]

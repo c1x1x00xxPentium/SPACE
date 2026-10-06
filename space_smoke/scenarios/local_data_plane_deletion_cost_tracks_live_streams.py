@@ -2,9 +2,9 @@
 
 import space_smoke as smoke
 
-# Long enough to outlast the writer's worst-case latency for the "10" write:
-# one 10 s tick plus a 30 s per-pod write interval if a precondition write to
-# "0" just landed.
+# Long enough for the "10" write (a raise, so one 10 s tick) and its 60 s
+# settle budget, and to put the close more than 30 s after that write so the
+# lowering back to "0" isn't held back.
 HOLD_SECONDS = 90
 
 
