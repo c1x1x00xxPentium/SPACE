@@ -21,7 +21,10 @@ pub const DATA_PLANE_INTERNAL_PORT_NAME: &str = "internal";
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataPlaneStreamLoad {
-    /// Every stream attached to this replica right now, whatever its age:
-    /// what a scale-in that removes this replica would cut.
+    /// Streams attached to this replica right now, whatever their age: every
+    /// connection holding an attached-stream permit (native sessions, ECW
+    /// process and file-watch streams, upgraded ECW service-port connections).
+    /// Plain HTTP requests through ECW service ingress, including long-lived
+    /// responses such as server-sent events, hold no permit and aren't counted.
     pub active_streams: u64,
 }

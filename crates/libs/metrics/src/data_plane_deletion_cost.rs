@@ -32,8 +32,9 @@ metric_vocabulary!(
         /// while the desired bucket is `0` (an absent annotation already ranks
         /// as cost 0).
         Unchanged => "unchanged",
-        /// The bucket changed, but this pod was written less than the minimum
-        /// write interval ago; the write waits for a later tick.
+        /// The bucket dropped, but this pod's last write attempt (failed ones
+        /// included) started less than the minimum write interval ago; the
+        /// lowering waits for a later tick. Raises are never rate-limited.
         RateLimited => "rate_limited",
         /// The apiserver rejected the patch, or it timed out.
         Error => "error",

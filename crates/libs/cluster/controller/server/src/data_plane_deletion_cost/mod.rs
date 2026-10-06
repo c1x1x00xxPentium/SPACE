@@ -13,7 +13,11 @@
 //! terminal or port-forward just as surely as a new one. The cost only orders
 //! deletion (lower first, best effort); it can never block or delay a scale-in,
 //! so a replica that keeps a high cost because its streams are long-lived is
-//! simply removed last, which is where it belongs.
+//! simply removed last, which is where it belongs. "Attached stream" means a
+//! connection holding the data plane's attached-stream permit; plain HTTP
+//! requests through ECW service ingress, including long responses such as
+//! server-sent events, hold none and don't count (see
+//! `DataPlaneStreamLoad::active_streams`).
 //!
 //! The data plane does not write its own annotation: that would grant the
 //! internet-facing pod `patch` on pods in its namespace. This process is
@@ -29,8 +33,10 @@
 //!   written only when the bucket changes. Lowering a pod's cost waits at least
 //!   [`ReconcilerConfig::min_write_interval`] since its last write; raising it
 //!   doesn't, because every moment a busy pod still reads low is a moment a
-//!   scale-in removes it first. A raise always follows a lowering, so a pod is
-//!   still written at most about twice per interval. Pod updates fan out to
+//!   scale-in removes it first. Every write attempt, raise or lowering, resets
+//!   the interval, so a pod gets at most one lowering per interval plus one
+//!   raise per bucket step (at most three), and a load oscillating across one
+//!   bucket boundary is written about twice per 40s. Pod updates fan out to
 //!   every watcher of the namespace, so a raw count would be a write per stream.
 //! - **Unknown load ranks as busy.** One failed or timed-out probe writes
 //!   nothing; after [`ReconcilerConfig::unknown_as_busy_after`] consecutive
