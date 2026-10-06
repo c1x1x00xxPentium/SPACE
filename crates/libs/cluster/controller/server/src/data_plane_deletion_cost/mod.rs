@@ -29,13 +29,15 @@
 //!   written only when the bucket changes, and at most once per
 //!   [`ReconcilerConfig::min_write_interval`] per pod. Pod updates fan out to
 //!   every watcher of the namespace, so a raw count would be a write per stream.
-//! - **Unknown load keeps the last known value.** A probe that fails or times
-//!   out writes nothing, for as long as it keeps failing. A stale high value
-//!   only means that pod goes last; a guessed low one could delete a busy pod.
-//!   Pods in this state are visible as the `unknown` bucket of
-//!   `data_plane_deletion_cost.pods`, and the data plane exits if its internal
-//!   listener stops, so a Ready pod that stays unreadable is a network or
-//!   overload problem worth alerting on.
+//! - **Unknown load ranks as busy.** One failed or timed-out probe writes
+//!   nothing; after [`ReconcilerConfig::unknown_as_busy_after`] consecutive
+//!   failures the pod is written the top bucket. Keeping the last value would
+//!   keep a stale low one too: an idle pod whose probes start failing while it
+//!   takes streams would stay first in line. Ranking unknown as busy only ever
+//!   errs toward removing that pod last. Such pods count in the `unknown`
+//!   bucket of `data_plane_deletion_cost.pods`, and the data plane exits if its
+//!   internal listener stops, so a Ready pod that stays unreadable is a network
+//!   or overload problem worth alerting on.
 //! - **Disabling stops the writes, not the ranking.** Turning the reconciler off
 //!   leaves each pod's last value in place until the pod is replaced.
 //! - **Best effort.** This orders deletion; it guarantees nothing. When every
@@ -80,11 +82,14 @@ const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Probes and patches in flight at once. Worst case a tick takes
 /// `ceil(pods / 8) * DEFAULT_PROBE_TIMEOUT + ceil(writes / 8) * DEFAULT_WRITE_TIMEOUT`:
-/// 7s for 8 unresponsive pods that all need a write, which fits in one tick;
-/// a larger, mostly unresponsive fleet stretches the tick, and
-/// `MissedTickBehavior::Delay` pushes the next one back rather than stacking
-/// them. Healthy probes answer in milliseconds.
+/// 7s for 8 pods whose probes take just under the timeout and whose patches
+/// all hang, which fits in one tick; a larger fleet in that state stretches
+/// the tick, and `MissedTickBehavior::Delay` pushes the next one back rather
+/// than stacking them. Healthy probes answer in milliseconds.
 const DEFAULT_CONCURRENCY: usize = 8;
+/// Consecutive failed probes before a pod ranks as busy: about 30s at the
+/// default tick, so one dropped request changes nothing.
+const DEFAULT_UNKNOWN_AS_BUSY_AFTER: u32 = 3;
 
 /// One of the four values the writer publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -170,10 +175,14 @@ pub struct ReconcilerConfig {
     pub namespace: String,
     pub pod_selector: String,
     pub tick: Duration,
-    /// Minimum time between two writes to the same pod. Measured from tick to
-    /// tick, so with a 10s tick a pod whose bucket keeps changing is written
-    /// every 30–40s.
+    /// Minimum time between two writes to the same pod, measured from the
+    /// start of one write attempt to the tick that plans the next. With a 10s
+    /// tick a pod whose bucket keeps changing is written at least 30s apart,
+    /// usually 30–40s; slow ticks stretch it further.
     pub min_write_interval: Duration,
+    /// Consecutive failed probes after which a pod's load is treated as the top
+    /// bucket. See the module docs for why unknown ranks as busy.
+    pub unknown_as_busy_after: u32,
     pub probe_timeout: Duration,
     pub write_timeout: Duration,
     pub concurrency: usize,
@@ -187,6 +196,7 @@ impl Default for ReconcilerConfig {
             pod_selector: DEFAULT_POD_SELECTOR.to_string(),
             tick: DEFAULT_TICK,
             min_write_interval: DEFAULT_MIN_WRITE_INTERVAL,
+            unknown_as_busy_after: DEFAULT_UNKNOWN_AS_BUSY_AFTER,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             concurrency: DEFAULT_CONCURRENCY,
@@ -253,14 +263,14 @@ fn decide(
     }
 }
 
-/// Per-pod-UID memory across ticks: the last write, and which pods are in a
-/// run of failed probes. Entries are dropped once the pod is gone or
+/// Per-pod-UID memory across ticks: the last write attempt, and how many
+/// probes in a row have failed. Entries are dropped once the pod is gone or
 /// terminating, not when it is merely NotReady, so both are bounded by the
 /// live Deployment size and a readiness flap resets neither.
 #[derive(Debug, Default)]
 struct WriteHistory {
     last_write: HashMap<String, Instant>,
-    failing: HashSet<String>,
+    failing: HashMap<String, u32>,
 }
 
 impl WriteHistory {
@@ -272,19 +282,21 @@ impl WriteHistory {
         self.last_write.insert(uid, at);
     }
 
-    /// Mark a failed probe; true when it starts a new run of failures.
-    fn probe_failed(&mut self, uid: &str) -> bool {
-        self.failing.insert(uid.to_string())
+    /// Mark a failed probe; returns how many in a row have now failed.
+    fn probe_failed(&mut self, uid: &str) -> u32 {
+        let count = self.failing.entry(uid.to_string()).or_default();
+        *count = count.saturating_add(1);
+        *count
     }
 
     /// Mark a successful probe; true when it ends a run of failures.
     fn probe_succeeded(&mut self, uid: &str) -> bool {
-        self.failing.remove(uid)
+        self.failing.remove(uid).is_some()
     }
 
     fn retain_live(&mut self, live_uids: &HashSet<String>) {
         self.last_write.retain(|uid, _| live_uids.contains(uid));
-        self.failing.retain(|uid| live_uids.contains(uid));
+        self.failing.retain(|uid, _| live_uids.contains(uid));
     }
 }
 
@@ -389,21 +401,45 @@ async fn reconcile_once<B: DeletionCostBackend>(
             }
             Err(failure) => {
                 unknown += 1;
-                // Once per run of failures, so an unreachable pod is one line,
-                // not one every tick.
-                if history.probe_failed(&pod.uid) {
+                let failures = history.probe_failed(&pod.uid);
+                // Logged at the start of a run and when it tips into busy, so
+                // an unreachable pod is two lines, not one every tick.
+                if failures == 1 {
                     tracing::warn!(
                         pod = %pod.name,
                         failure = %failure,
                         "data-plane stream-load probe failed; keeping the pod's last \
-                         deletion cost until a probe succeeds"
+                         deletion cost for now"
+                    );
+                } else if failures == config.unknown_as_busy_after {
+                    tracing::warn!(
+                        pod = %pod.name,
+                        failures,
+                        failure = %failure,
+                        "data-plane stream-load probe keeps failing; ranking the pod as \
+                         busy until a probe succeeds"
                     );
                 } else {
                     tracing::debug!(
                         pod = %pod.name,
+                        failures,
                         failure = %failure,
                         "data-plane stream-load probe still failing"
                     );
+                }
+                if failures < config.unknown_as_busy_after {
+                    continue;
+                }
+                match decide(
+                    pod.current.as_deref(),
+                    DeletionCost::High,
+                    history.get(&pod.uid),
+                    now,
+                    config.min_write_interval,
+                ) {
+                    WriteDecision::Unchanged => unchanged += 1,
+                    WriteDecision::RateLimited => rate_limited += 1,
+                    WriteDecision::Write(desired) => writes.push((pod, desired)),
                 }
                 continue;
             }
@@ -433,14 +469,23 @@ async fn reconcile_once<B: DeletionCostBackend>(
 
     // An attempt counts against the interval whether or not it lands, so a pod
     // whose patch keeps failing is retried at the write rate, not every tick.
-    for (pod, _) in &writes {
-        history.record(pod.uid.clone(), now);
-    }
-    let outcomes: Vec<WriteOutcome> = futures_util::stream::iter(writes)
-        .map(|(pod, desired)| async move { write_one(backend, config, &pod, desired).await })
+    // Stamped when the attempt starts, not when it was queued, so a slow
+    // apiserver that holds writes behind the concurrency limit can't shorten
+    // a pod's interval.
+    let attempts: Vec<(String, Instant, WriteOutcome)> = futures_util::stream::iter(writes)
+        .map(|(pod, desired)| async move {
+            let started = Instant::now();
+            let outcome = write_one(backend, config, &pod, desired).await;
+            (pod.uid, started, outcome)
+        })
         .buffer_unordered(config.concurrency)
         .collect()
         .await;
+    let mut outcomes = Vec::with_capacity(attempts.len());
+    for (uid, started, outcome) in attempts {
+        history.record(uid, started);
+        outcomes.push(outcome);
+    }
     let applied = outcomes
         .iter()
         .filter(|outcome| **outcome == WriteOutcome::Applied)

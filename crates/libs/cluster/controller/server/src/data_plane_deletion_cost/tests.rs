@@ -26,6 +26,7 @@ struct FakeBackend {
     not_ready: Mutex<std::collections::HashSet<String>>,
     loads: Mutex<HashMap<String, FakeLoad>>,
     fail_writes: Mutex<bool>,
+    write_delay: Mutex<Duration>,
     probes: Mutex<Vec<String>>,
     writes: Mutex<Vec<(String, String, DeletionCost)>>,
 }
@@ -95,6 +96,10 @@ impl DeletionCostBackend for FakeBackend {
     }
 
     async fn set_cost(&self, pod: &DataPlanePod, cost: DeletionCost) -> Result<(), BackendError> {
+        let delay = *self.write_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         self.writes
             .lock()
             .unwrap()
@@ -288,45 +293,89 @@ async fn a_hung_probe_times_out_and_leaves_the_annotation_alone() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_unreadable_pod_keeps_its_last_cost_indefinitely() {
-    let backend = FakeBackend::with_pods(vec![(pod("dp", None), FakeLoad::Active(500))]);
+async fn an_unreadable_pod_ranks_as_busy_after_a_run_of_failures() {
+    let backend = FakeBackend::with_pods(vec![
+        (pod("was-idle", Some("0")), FakeLoad::Fail),
+        (pod("was-busy", Some("1000")), FakeLoad::Fail),
+    ]);
     let config = config();
     let mut history = WriteHistory::default();
 
-    reconcile_once(&backend, &config, &mut history).await;
-    assert_eq!(backend.take_writes(), vec![write("dp", DeletionCost::High)]);
+    for _ in 1..config.unknown_as_busy_after {
+        reconcile_once(&backend, &config, &mut history).await;
+        tokio::time::advance(config.tick).await;
+    }
+    assert!(
+        backend.take_writes().is_empty(),
+        "a short run of failed probes changes nothing"
+    );
 
-    backend.set_load("dp", FakeLoad::Fail);
+    reconcile_once(&backend, &config, &mut history).await;
+    assert_eq!(
+        backend.take_writes(),
+        vec![write("was-idle", DeletionCost::High)],
+        "a stale low cost must not put a pod of unknown load first in line; \
+         a stale high one is already where unknown belongs"
+    );
+
     for _ in 0..(24 * 60 * 6) {
         tokio::time::advance(config.tick).await;
         reconcile_once(&backend, &config, &mut history).await;
     }
     assert!(
         backend.take_writes().is_empty(),
-        "a day of failed probes must not lower a busy pod's cost: a guessed \
-         low value could get it deleted first"
+        "a day more of failures keeps both pods ranked busy"
     );
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_run_of_failed_probes_is_tracked_once_and_cleared_on_recovery() {
-    let backend = FakeBackend::with_pods(vec![(pod("dp", Some("10")), FakeLoad::Fail)]);
+async fn a_recovered_probe_ranks_the_pod_by_its_real_load_again() {
+    let backend = FakeBackend::with_pods(vec![(pod("dp", Some("0")), FakeLoad::Fail)]);
     let config = config();
     let mut history = WriteHistory::default();
 
-    reconcile_once(&backend, &config, &mut history).await;
-    assert!(history.failing.contains("uid-dp"));
-    assert!(
-        !history.probe_failed("uid-dp"),
-        "a second failure continues the run instead of starting one"
-    );
+    for _ in 0..config.unknown_as_busy_after {
+        reconcile_once(&backend, &config, &mut history).await;
+        tokio::time::advance(config.tick).await;
+    }
+    assert_eq!(backend.take_writes(), vec![write("dp", DeletionCost::High)]);
+    assert!(history.failing.contains_key("uid-dp"));
 
-    backend.set_load("dp", FakeLoad::Active(5));
-    tokio::time::advance(config.tick).await;
+    backend.set_load("dp", FakeLoad::Active(0));
+    tokio::time::advance(config.min_write_interval).await;
     reconcile_once(&backend, &config, &mut history).await;
+    assert_eq!(backend.take_writes(), vec![write("dp", DeletionCost::Idle)]);
     assert!(
         history.failing.is_empty(),
         "a successful probe ends the run"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_queued_behind_the_concurrency_limit_is_stamped_when_it_starts() {
+    let pods: Vec<_> = (0..9)
+        .map(|i| (pod(&format!("dp{i}"), None), FakeLoad::Active(5)))
+        .collect();
+    let backend = FakeBackend::with_pods(pods);
+    *backend.write_delay.lock().unwrap() = Duration::from_secs(5);
+    let config = config();
+    assert_eq!(config.concurrency, 8);
+    let mut history = WriteHistory::default();
+
+    let tick_start = Instant::now();
+    reconcile_once(&backend, &config, &mut history).await;
+
+    let mut stamps: Vec<Duration> = history
+        .last_write
+        .values()
+        .map(|at| at.saturating_duration_since(tick_start))
+        .collect();
+    stamps.sort();
+    assert_eq!(stamps.len(), 9);
+    assert_eq!(
+        stamps.last().copied(),
+        Some(Duration::from_secs(5)),
+        "the ninth write started after the first eight finished"
     );
 }
 

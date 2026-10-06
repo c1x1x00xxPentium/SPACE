@@ -14,11 +14,11 @@ metric_vocabulary!(
         /// The report was read and parsed.
         Ok => "ok",
         /// The pod IP did not parse, or the request failed, returned a
-        /// non-success status, or carried an unparseable body. The pod's
-        /// annotation keeps its last value.
+        /// non-success status, or carried an unparseable body. The pod counts
+        /// as `unknown`; a run of these ranks it as busy.
         Error => "error",
-        /// The request did not finish within the probe timeout. The pod's
-        /// annotation keeps its last value.
+        /// The request did not finish within the probe timeout. The pod counts
+        /// as `unknown`; a run of these ranks it as busy.
         Timeout => "timeout",
     }
 );
@@ -51,9 +51,10 @@ metric_vocabulary!(
         Medium => "100",
         /// 100 or more attached streams.
         High => "1000",
-        /// The probe failed this tick, so the load is unknown and the pod
-        /// keeps whatever annotation it had. Alert on this staying non-zero:
-        /// the ordering signal for those pods is not being refreshed.
+        /// The probe failed this tick, so the load is unknown. The pod keeps
+        /// its annotation for a short run of failures and is then written the
+        /// top bucket (unknown ranks as busy). Alert on this staying non-zero:
+        /// the ordering signal for those pods is not being measured.
         Unknown => "unknown",
     }
 );
@@ -78,9 +79,11 @@ pub fn writes(outcome: WriteOutcome, count: u64) {
     );
 }
 
-/// Ready data-plane pods in `bucket` this tick. Emitted for every bucket each
-/// tick, zeros included, so a bucket that empties reads as zero rather than
-/// holding its last value; the buckets sum to the Ready pods probed.
+/// Ready data-plane pods in `bucket` this tick. Every bucket is emitted on each
+/// tick that probes, zeros included, so a bucket that empties reads as zero;
+/// the buckets sum to the Ready pods probed. Nothing is emitted while the pod
+/// reflector is cold or on a replica that isn't the leader, so a silent gauge
+/// means the writer isn't running, not that the fleet is empty.
 pub fn pods(bucket: CostBucket, count: usize) {
     gauge(
         "data_plane_deletion_cost.pods",

@@ -24,9 +24,11 @@ class _Fixture:
     def __init__(self) -> None:
         self.records: dict[str, object] = {}
         self.waits = 0
+        self.evidence: dict[str, object] = {}
 
-    def verify(self, condition: bool, message: str, **_evidence: object) -> None:
+    def verify(self, condition: bool, message: str, **evidence: object) -> None:
         if not condition:
+            self.evidence = evidence
             raise InvariantViolation(message)
 
     def record(self, name: str, value: object) -> None:
@@ -44,6 +46,9 @@ class _Observer:
         if len(self.observations) > 1:
             return self.observations.pop(0)
         return self.observations[0]
+
+    def data_plane_stream_loads(self) -> dict[str, int | None]:
+        return {"dp-a": 3}
 
 
 def _assertions(*observations: dict[str, str | None]) -> tuple[DataPlaneDeletionCostAssertions, _Fixture]:
@@ -73,10 +78,15 @@ class Assertions(unittest.TestCase):
         self.assertEqual(fixture.records["before_stream_costs"], {"dp-a": "0", "dp-b": None})
 
     def test_idle_fails_when_a_pod_never_settles(self) -> None:
-        cost, _ = _assertions({"dp-a": "10"})
+        cost, fixture = _assertions({"dp-a": "10"})
         with mock.patch("space_smoke.data_plane_deletion_cost.time.monotonic", _Clock()):
             with self.assertRaises(InvariantViolation):
                 cost.expect_all_idle(label="after_stream", timeout=30)
+        self.assertEqual(
+            fixture.evidence.get("data_plane_active_streams"),
+            {"dp-a": 3},
+            "a failed settle reports what each pod really holds",
+        )
 
     def test_no_ready_pod_fails_instead_of_passing_vacuously(self) -> None:
         cost, _ = _assertions({})
@@ -96,14 +106,25 @@ class Assertions(unittest.TestCase):
                     cost.expect_one_stream(timeout=30)
 
 
-def _pod(name: str, *, ready: bool = True, terminating: bool = False, cost: str | None = None) -> dict:
+def _pod(
+    name: str,
+    *,
+    ready: bool = True,
+    terminating: bool = False,
+    cost: str | None = None,
+    internal_port: int | None = None,
+) -> dict:
     metadata: dict[str, object] = {"name": name}
     if terminating:
         metadata["deletionTimestamp"] = "2026-10-04T00:00:00Z"
     if cost is not None:
         metadata["annotations"] = {ANNOTATION: cost}
+    ports = [{"name": "http", "containerPort": 8090}]
+    if internal_port is not None:
+        ports.append({"name": "internal", "containerPort": internal_port})
     return {
         "metadata": metadata,
+        "spec": {"containers": [{"name": "data-plane", "ports": ports}]},
         "status": {"conditions": [{"type": "Ready", "status": "True" if ready else "False"}]},
     }
 
@@ -137,6 +158,35 @@ class HarnessRead(unittest.TestCase):
         self.assertIn("get", call)
         self.assertIn("app.kubernetes.io/name=space-data-plane", call)
         self.assertFalse({"patch", "annotate", "apply", "delete"} & set(call))
+
+    def test_reads_stream_loads_through_the_pod_proxy_read_only(self) -> None:
+        pods = json.dumps({"items": [
+            _pod("dp-a", internal_port=8091),
+            _pod("dp-unreachable", internal_port=8091),
+            _pod("dp-no-listener"),
+            _pod("dp-unready", ready=False, internal_port=8091),
+        ]})
+        kubectl = _ScriptedKubectl([
+            CommandResult(("kubectl",), 0, pods, ""),
+            CommandResult(("kubectl",), 0, json.dumps({"active_streams": 4}), ""),
+            CommandResult(("kubectl",), 1, "", "error trying to reach service"),
+        ])
+        harness = KindHarness(kubectl, KindConfig())
+
+        self.assertEqual(
+            harness.data_plane_stream_loads(),
+            {"dp-a": 4, "dp-unreachable": None, "dp-no-listener": None},
+        )
+        proxy_call = kubectl.calls[1]
+        self.assertIn("--raw", proxy_call)
+        self.assertEqual(
+            proxy_call[proxy_call.index("--raw") + 1],
+            "/api/v1/namespaces/space/pods/dp-a:8091/proxy/internal/v1/stream-load",
+        )
+        for call in kubectl.calls:
+            self.assertEqual(call[call.index("--context") + 1], KindConfig().context)
+            self.assertIn("get", call)
+            self.assertFalse({"patch", "annotate", "apply", "delete", "exec"} & set(call))
 
     def test_a_failed_read_raises(self) -> None:
         harness = KindHarness(_ScriptedKubectl([CommandResult(("kubectl",), 1, "", "forbidden")]), KindConfig())

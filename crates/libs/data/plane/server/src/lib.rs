@@ -395,7 +395,7 @@ pub async fn run(
     tracing::info!(listen = %config.listen, "space-data-plane-svc listening");
     // The internal listener's lifetime is tied to the process: if it dies, the
     // replica shuts down and exits non-zero instead of serving traffic while the
-    // cluster controller reads it as unreachable and, after a window, as idle.
+    // cluster controller can't read its load.
     let internal_task = internal_listener.map(|(internal_listener, listen)| {
         tracing::info!(listen = %listen, "space-data-plane-svc internal stream-load listener");
         stream_load::spawn_internal(internal_listener, attached_streams, shutdown_token.clone())

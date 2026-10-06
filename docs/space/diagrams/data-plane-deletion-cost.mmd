@@ -17,7 +17,7 @@ flowchart LR
         tick["every 10s: probe Ready pods (2s timeout, 8 at once)"]:::cc
         bucket["bucket attached streams → cost<br/>0 streams → 0<br/>1–9 → 10<br/>10–99 → 100<br/>100+ → 1000"]:::cc
         decide{"bucket changed?<br/>≥30s since this pod's last write?"}:::gate
-        stale["probe failed: keep last value<br/>count in 'unknown' gauge<br/>warn once per failure run"]:::warn
+        stale["probe failed: count as 'unknown'<br/>3 failures in a row → rank busy (1000)<br/>warn at start and at the switch"]:::warn
         refl --> tick --> bucket --> decide
         tick -. failure .-> stale
     end
@@ -28,6 +28,7 @@ flowchart LR
     client --> alb --> permits
     report -- "pod IP : internal" --> tick
     decide -- yes --> api
+    stale -. "busy write" .-> api
     api --> rs
 
     classDef ext fill:#eeeeee,stroke:#777,color:#222

@@ -40,8 +40,8 @@ async fn stream_load_handler(
 /// The listener's lifetime is tied to the process: if the serve task ends while
 /// `shutdown` is still live, the supervisor cancels `shutdown` (so the public
 /// listener drains and the process exits) and returns an error for `run` to
-/// surface. A replica that kept serving without its load report would read as
-/// unreachable to the cluster controller and, after a window, as idle.
+/// surface. A replica that kept serving without its load report would have its
+/// ordering signal frozen and then guessed by the cluster controller.
 ///
 /// With graceful shutdown, `axum::serve` neither errors nor returns before the
 /// signal fires (it retries failed accepts), so in practice the early end this

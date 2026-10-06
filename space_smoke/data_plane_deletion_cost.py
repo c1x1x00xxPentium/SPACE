@@ -1,7 +1,8 @@
 """The data plane's scale-in ordering, observed on a real cluster.
 
 The cluster controller probes each Ready data-plane pod's internal stream-load
-listener, buckets its attached streams (0 / 10 / 100 / 1000), and writes the bucket as `controller.kubernetes.io/pod-deletion-cost`,
+listener, buckets its attached streams (0 / 10 / 100 / 1000), and
+writes the bucket as `controller.kubernetes.io/pod-deletion-cost`,
 so a ReplicaSet scale-down removes idle replicas first. Unit tests cover the
 bucketing, the write decision, and the rate limit against a fake backend;
 what only a cluster shows is the whole chain: the data plane's internal
@@ -62,12 +63,16 @@ class DataPlaneDeletionCostAssertions:
             costs = self._ready_costs()
             if settled(costs):
                 return costs, round(time.monotonic() - started, 1)
-            self._fixture.verify(
-                time.monotonic() - started < timeout,
-                failure,
-                data_plane_costs=costs,
-                timeout_seconds=timeout,
-            )
+            if time.monotonic() - started >= timeout:
+                # Read only on failure: says whether the pod really holds
+                # streams (left by an earlier scenario) or the writer lagged.
+                self._fixture.verify(
+                    False,
+                    failure,
+                    data_plane_costs=costs,
+                    data_plane_active_streams=self._observer.data_plane_stream_loads(),
+                    timeout_seconds=timeout,
+                )
             self._fixture.wait(POLL_SECONDS, reason="await the deletion-cost writer")
 
     def expect_all_idle(self, *, label: str, timeout: float = SETTLE_TIMEOUT) -> None:

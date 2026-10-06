@@ -153,6 +153,37 @@ def _ready_pod_annotations(pods_json: str, annotation: str) -> dict[str, str | N
     return observed
 
 
+def _ready_pod_named_ports(pods_json: str, port_name: str) -> dict[str, int | None]:
+    """Ready, non-terminating pods by name, mapped to the container port named `port_name`."""
+    ports: dict[str, int | None] = {}
+    for pod in json.loads(pods_json or "{}").get("items", []):
+        metadata = pod.get("metadata") or {}
+        if metadata.get("deletionTimestamp"):
+            continue
+        conditions = (pod.get("status") or {}).get("conditions") or []
+        if not any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
+            continue
+        port = next(
+            (
+                int(entry["containerPort"])
+                for container in (pod.get("spec") or {}).get("containers") or []
+                for entry in container.get("ports") or []
+                if entry.get("name") == port_name and "containerPort" in entry
+            ),
+            None,
+        )
+        ports[str(metadata.get("name", ""))] = port
+    return ports
+
+
+def _active_streams(report_json: str) -> int | None:
+    try:
+        value = json.loads(report_json).get("active_streams")
+    except (ValueError, AttributeError):
+        return None
+    return value if isinstance(value, int) else None
+
+
 def _truthy_default(value: str | None, default: bool) -> bool:
     """Match cluster-controller's accepted boolean environment vocabulary."""
 
@@ -326,6 +357,8 @@ KIND_SEAWEEDFS_DEPLOYMENT = "space-seaweedfs"
 KIND_SEAWEEDFS_POD_SELECTOR = "app.kubernetes.io/name=space-seaweedfs"
 KIND_INTERNAL_API_SELECTOR = "app.kubernetes.io/name=space-internal-api"
 KIND_DATA_PLANE_SELECTOR = "app.kubernetes.io/name=space-data-plane"
+DATA_PLANE_INTERNAL_PORT_NAME = "internal"
+DATA_PLANE_STREAM_LOAD_PATH = "/internal/v1/stream-load"
 POD_DELETION_COST_ANNOTATION = "controller.kubernetes.io/pod-deletion-cost"
 PENDING_BACKUP_QUEUE_SQL = """\
 SELECT artifact_id::text, artifact_kind FROM node_local_backup_pending
@@ -3009,6 +3042,25 @@ ON CONFLICT (key_hash) DO NOTHING;
         result = self.kubectl("get", "pods", "-l", KIND_DATA_PLANE_SELECTOR, "-o", "json", timeout=15)
         _require_ok(result, "read the data-plane pods")
         return _ready_pod_annotations(result.stdout, POD_DELETION_COST_ANNOTATION)
+
+    def data_plane_stream_loads(self) -> dict[str, int | None]:
+        result = self.kubectl("get", "pods", "-l", KIND_DATA_PLANE_SELECTOR, "-o", "json", timeout=15)
+        _require_ok(result, "read the data-plane pods")
+        loads: dict[str, int | None] = {}
+        for name, port in _ready_pod_named_ports(result.stdout, DATA_PLANE_INTERNAL_PORT_NAME).items():
+            if port is None:
+                loads[name] = None
+                continue
+            # A GET through the apiserver's pod proxy: read-only, and the only
+            # way to reach a port that is deliberately not on any Service.
+            report = self.kubectl(
+                "get",
+                "--raw",
+                f"/api/v1/namespaces/{KIND_NAMESPACE}/pods/{name}:{port}/proxy{DATA_PLANE_STREAM_LOAD_PATH}",
+                timeout=15,
+            )
+            loads[name] = _active_streams(report.stdout) if report.returncode == 0 else None
+        return loads
 
     def sandbox_pod_count(self) -> int:
         result = self.kubectl("get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15)

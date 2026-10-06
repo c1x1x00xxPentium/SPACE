@@ -598,6 +598,15 @@ class DataPlaneDeletionCostObserver(Protocol):
         """Ready, non-terminating data-plane pods by name, with the annotation value or None."""
         ...
 
+    def data_plane_stream_loads(self) -> dict[str, int | None]:
+        """Each Ready data-plane pod's own attached-stream count, from its internal
+        stream-load report read through the apiserver pod proxy; None when unreadable.
+
+        Failure evidence only: it says whether a pod that did not settle to cost 0
+        really holds streams (left by an earlier scenario) or the writer lagged.
+        """
+        ...
+
 
 class PendingBackupControl(Protocol):
     """Kind-only operations for the pending-backup census scenario.
