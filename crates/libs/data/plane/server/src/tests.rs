@@ -1337,7 +1337,7 @@ fn data_plane_429s_carry_their_limit_as_a_response_extension() {
     for (status, expected) in [
         (
             pplx_space_common_grpc::uds_per_sandbox_limit_exceeded_status("busy"),
-            TooManyRequestsReason::SandboxBusy,
+            TooManyRequestsReason::NodeSandboxLimit,
         ),
         (
             pplx_space_common_grpc::refused_before_start(

@@ -471,7 +471,7 @@ pub(super) fn tonic_status_to_ecw_error(status: tonic::Status) -> EcwProxyError 
             ResponseKind::Admission,
         )
         .with_retry_after(ECW_BACKEND_BUSY_RETRY_AFTER)
-        .with_too_many_requests_reason(TooManyRequestsReason::SandboxBusy)
+        .with_too_many_requests_reason(TooManyRequestsReason::NodeSandboxLimit)
         .with_backend_status(status);
     }
     // The guest refused before starting anything: say when to come back.

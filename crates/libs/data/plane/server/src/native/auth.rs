@@ -267,6 +267,7 @@ pub(crate) fn insert_retry_after(response: &mut Response, try_again: Option<std:
             .insert(axum::http::header::RETRY_AFTER, value);
     }
 }
+
 pub(crate) fn too_many_attached_streams_response(limit: AttachedStreamLimit) -> Response {
     let mut response = data_plane_http_error(
         StatusCode::TOO_MANY_REQUESTS,

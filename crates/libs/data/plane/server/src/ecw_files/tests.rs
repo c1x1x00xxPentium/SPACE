@@ -812,23 +812,44 @@ fn content_length_precheck_rejects_oversized_uploads() {
 }
 
 #[test]
-fn upload_reservation_uses_declared_length_capped_at_the_body_limit() {
-    let limit = E2B_FILE_CONTENT_LIMIT_BYTES as u64;
-    for (content_length, expected) in [
-        (Some("4096".to_string()), 4096),
-        (Some(" 0 ".to_string()), 0),
-        (Some((limit + 1).to_string()), limit),
-        (Some("not-a-number".to_string()), limit),
-        (None, limit),
+fn upload_reservation_uses_declared_length_capped_at_the_content_type_limit() {
+    let file_limit = E2B_FILE_CONTENT_LIMIT_BYTES as u64;
+    let json_limit = E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES as u64;
+    for (content_type, content_length, expected) in [
+        (
+            Some("application/octet-stream"),
+            Some("4096".to_string()),
+            4096,
+        ),
+        (Some("application/octet-stream"), Some(" 0 ".to_string()), 0),
+        (
+            Some("application/octet-stream"),
+            Some((file_limit + 1).to_string()),
+            file_limit,
+        ),
+        (Some("application/octet-stream"), None, file_limit),
+        (Some("multipart/form-data; boundary=x"), None, file_limit),
+        (Some("application/json"), Some("4096".to_string()), 4096),
+        (Some("application/json"), None, json_limit),
+        (
+            Some("application/json"),
+            Some((file_limit).to_string()),
+            json_limit,
+        ),
+        // No Content-Type is written as JSON, so it gets the JSON cap.
+        (None, None, json_limit),
     ] {
         let mut headers = HeaderMap::new();
+        if let Some(content_type) = content_type {
+            headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+        }
         if let Some(content_length) = &content_length {
             headers.insert(header::CONTENT_LENGTH, content_length.parse().unwrap());
         }
         assert_eq!(
             upload_reservation_bytes(&headers),
             expected,
-            "{content_length:?}"
+            "{content_type:?} {content_length:?}"
         );
     }
 }

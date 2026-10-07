@@ -738,13 +738,14 @@ metric_vocabulary! {
         /// per-sandbox. The permit does not say which one rejected.
         IngressPreparation => "ingress_preparation",
         /// The node's per-sandbox request limiter rejected the backend call.
-        SandboxBusy => "sandbox_busy",
+        NodeSandboxLimit => "node_sandbox_limit",
         /// The sandbox refused before starting anything because it's at
         /// capacity.
         SandboxAtCapacity => "sandbox_at_capacity",
         /// A backend returned `RESOURCE_EXHAUSTED` with no more specific shape.
         BackendResourceExhausted => "backend_resource_exhausted",
-        /// The sandbox's own service answered 429; the data plane relayed it.
+        /// Not a data-plane limit: a relay marker on responses from the
+        /// sandbox's own service, so a 429 it returned isn't miscounted.
         SandboxService => "sandbox_service",
         /// A 429 whose producer did not name a reason.
         Unclassified => "unclassified",

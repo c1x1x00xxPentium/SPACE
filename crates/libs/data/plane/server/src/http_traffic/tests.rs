@@ -229,7 +229,7 @@ async fn every_429_is_counted_and_unnamed_ones_are_unclassified() {
                     let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
                     response
                         .extensions_mut()
-                        .insert(TooManyRequestsReason::SandboxBusy);
+                        .insert(TooManyRequestsReason::NodeSandboxLimit);
                     response
                 }),
             )
@@ -259,7 +259,7 @@ async fn every_429_is_counted_and_unnamed_ones_are_unclassified() {
         vec![
             vec![
                 "route_class:process".to_string(),
-                "reason:sandbox_busy".to_string()
+                "reason:node_sandbox_limit".to_string()
             ],
             vec![
                 "route_class:files".to_string(),

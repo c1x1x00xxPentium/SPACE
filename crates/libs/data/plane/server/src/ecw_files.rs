@@ -296,10 +296,19 @@ pub(super) async fn write_file(
 }
 
 /// What an upload admission limit would reserve for this request: the declared
-/// `Content-Length`, capped at the body limit, or the whole limit when the
-/// client declares none or an unparseable one.
+/// `Content-Length`, capped at the body limit for its content type, or that
+/// whole limit when the client declares no length. JSON writes, including a
+/// request with no `Content-Type`, are capped far lower than file bodies.
 fn upload_reservation_bytes(headers: &HeaderMap) -> u64 {
-    let limit = E2B_FILE_CONTENT_LIMIT_BYTES as u64;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json");
+    let limit = if is_json_content_type(content_type) {
+        E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES
+    } else {
+        E2B_FILE_CONTENT_LIMIT_BYTES
+    } as u64;
     headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
