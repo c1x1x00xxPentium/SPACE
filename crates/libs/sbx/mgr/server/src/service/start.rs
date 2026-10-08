@@ -1369,6 +1369,7 @@ impl SandboxManagerService {
                     content_hash: sandbox.template_hash.clone(),
                     tag: None,
                 },
+                sandbox,
             )
             .await?;
             reject_incompatible_template_spaced_compatibility(
