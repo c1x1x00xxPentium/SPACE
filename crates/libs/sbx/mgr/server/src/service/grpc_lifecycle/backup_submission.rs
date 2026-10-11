@@ -4,6 +4,35 @@
 
 use super::*;
 
+/// The execution metadata an artifact backup records. A disk artifact carries
+/// no vCPU state, so it has no capture CPU, whatever its metadata says.
+pub(super) fn artifact_backup_execution(
+    execution: pplx_space_common_core::types::SnapshotExecutionMetadata,
+    artifact_kind: pplx_space_common_core::types::ArtifactKind,
+) -> pplx_space_common_core::types::SnapshotExecutionMetadata {
+    match artifact_kind {
+        pplx_space_common_core::types::ArtifactKind::Full => execution,
+        pplx_space_common_core::types::ArtifactKind::Disk => execution.with_host_cpu(None),
+    }
+}
+
+/// [`suspend_snapshot_metadata`] for a suspend this host just captured. The VM
+/// state was captured here, so this host's CPU is recorded as its capture CPU:
+/// a host with a different CPU may not be able to load the vCPU state.
+pub(super) fn captured_suspend_snapshot_metadata(
+    sandbox: &crate::db::SandboxRow,
+    format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+) -> Result<crate::snapshot_upload::SnapshotMeta, Status> {
+    let mut metadata = suspend_snapshot_metadata(sandbox, format)?;
+    metadata.execution = metadata.execution.map(|execution| {
+        execution.with_host_cpu(pplx_space_common_core::types::HostCpu::current().cloned())
+    });
+    Ok(metadata)
+}
+
+/// Snapshot metadata built from the sandbox's current state. It records no
+/// capture CPU: a caller rebuilding metadata for an artifact captured earlier
+/// can't know which host captured it.
 pub(super) fn suspend_snapshot_metadata(
     sandbox: &crate::db::SandboxRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
@@ -268,10 +297,11 @@ impl SandboxManagerService {
         // worker may execute after this process exits and must not need to
         // rediscover capture-time execution identity from the replacement
         // host.
-        meta.execution = Some(
+        meta.execution = Some(artifact_backup_execution(
             meta.execution_metadata(host_architecture().map_err(|error| error.to_string())?)
                 .map_err(|error| error.to_string())?,
-        );
+            artifact_kind,
+        ));
 
         // Every backup attempt gets a fresh UUIDv7 identity. It names the
         // per-attempt S3 prefix before any vol-mgr submission; the cluster row is

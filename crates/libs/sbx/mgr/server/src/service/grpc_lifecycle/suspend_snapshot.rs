@@ -781,7 +781,7 @@ impl SandboxManagerService {
             }
 
             let publish_started_at = std::time::Instant::now();
-            let mut metadata = match suspend_snapshot_metadata(&sandbox, published_format) {
+            let mut metadata = match captured_suspend_snapshot_metadata(&sandbox, published_format) {
                 Ok(metadata) => metadata,
                 Err(status) => {
                     let reason = format!("local artifact metadata construction failed: {status}");
