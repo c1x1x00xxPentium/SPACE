@@ -11,7 +11,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use pplx_space_common_core::types::{IdempotencyKey, SandboxOwnerSource};
-use pplx_space_public_api::{OperationId, PublicSandboxId};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -86,9 +85,9 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
     if let Some(raw) = params.get("sandbox_id") {
         // Lifecycle actions share the {sandbox_id} mount with point reads.
         let raw = raw.split_once(':').map_or(raw.as_str(), |(id, _)| id);
-        let sandbox_id: PublicSandboxId = raw
-            .parse()
-            .map_err(|_| PublicApiError::not_found("sandbox not found"))?;
+        // A malformed id names no sandbox, so rejecting it as the handlers do
+        // reveals nothing; only a well-formed id is withheld as not found.
+        let sandbox_id = super::sandboxes::parse_public_sandbox_id(raw)?;
         let scope = match &owner {
             Some(owner) => SandboxAccessScope::FederatedSubject {
                 owner: owner.clone(),
@@ -151,9 +150,8 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
                 .map_err(super::sandboxes::controller_error)?;
         }
     } else if let Some(raw) = params.get("operation_id") {
-        let operation_id: OperationId = raw
-            .parse()
-            .map_err(|_| PublicApiError::not_found("operation not found"))?;
+        // As for sandboxes: malformed is the handler's 400, unseen is 404.
+        let operation_id = super::operations::parse_operation_id(raw)?;
         if !PublicOperationStore::new(state.pool.clone())
             .operation_in_owner_scope(org_id, subject_id, operation_id)
             .await?
