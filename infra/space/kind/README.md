@@ -6,7 +6,8 @@ pause container is hijacked by `containerd-shim-space-v2` into a real
 Firecracker microVM), the production worker service set on every sandbox
 node, a dedicated builder role that runs actual ECW recipes, node registration
 through node-ctl → internal-api, templates distributed through the production
-publish/pull path, and real S3 snapshot transit via an in-cluster versitygw object store. The
+publish/pull path, and real S3 snapshot transit via an in-cluster object store (versitygw, or
+SeaweedFS with STS when storage credentials are exchanged). The
 remaining deviations from production are listed in "How it differs from
 production" below.
 
@@ -846,7 +847,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   └── identical to worker
 ├── worker3 [pool=infra,    space.pplx.net/infra=true]
 │   ├── space-postgres        (StatefulSet)
-│   ├── space-object-store    (versitygw S3 gateway + bucket-init Job)
+│   ├── space-object-store    (versitygw S3 gateway, or SeaweedFS with STS, + bucket-init Job)
 │   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true)
 │   ├── space-admin-api       (Deployment; the same binary on the dedicated admin surface)
 │   ├── space-internal-api    (Deployment; ClusterApi — node registration + template releases)
@@ -1190,7 +1191,10 @@ placed on the node records
 (`crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs`), so the
 authority refuses builder callers with `node_identity_mismatch`. Kind's
 builders do not need it: their build-manager and volume-manager read the
-object store's static keys instead of exchanging tokens. Each node's
+object store's static keys instead of exchanging tokens, in both storage
+credentials modes ([Object-store credentials](#object-store-credentials)).
+Sandbox workers' volume-manager exchanges tokens through its node agent when
+the mode is `exchange`. Each node's
 credential-manager runs `--role=agent`: it holds the node's credential sockets
 under its service mutex and forwards every call upstream as the node credential
 agent, with no database, KEK or AWS credential. node-manager
@@ -1247,11 +1251,13 @@ asks of the hosting deployment.
 | Node image (packer) provides `/space/cache`, the cgroup subtree, loop devices, device permissions, SPACE accounts and the `/space` skeleton before any pod starts | Sandbox workers and builders boot the SPACE Kind node image, which bakes in the same as systemd units that run before kubelet on every node start (see [The node layer](#the-node-layer)) |
 | `/space/cache` is btrfs on instance-store NVMe            | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted on the node's `/space/cache` by `space-cache.service`, so it outlives pod restarts like the NVMe does |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, static Kubernetes Secrets             |
-| S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
+| S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style); SeaweedFS, which also serves STS, when `SPACE_KIND_STORAGE_CREDENTIALS=exchange` |
 | `space-credmgr-authority` Deployment whose platform KEK comes from an external intermediate-key broker, with TLS from its own certificate (`credmgr_authority_tls.tf`; the direct KMS backend is gone, `credmgr_authority_kms.tf`) | two replicas on the same broker path against the in-repo broker fixture (`space-kind-key-broker`), which derives keys instead of protecting them; TLS from a self-signed certificate `internal-rpc-tls.sh` issues per cluster |
 | Internal RPC CA and listener leaves issued by Terraform and synced by External Secrets (`internal_rpc_tls.tf`) | the same Secrets issued per cluster by `scripts/internal-rpc-tls.sh`; the ingress activation leaf names `space-api` rather than `space-ingress-activation` |
-| volume-manager credentials via credmgr STS/IRSA           | static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) |
-| build-manager gets S3 credentials via credential-manager backed by cloud identity | the same directly injected static object-store credentials; credential-manager's storage exchange endpoint is explicitly disabled |
+| volume-manager gets exact-object sessions through its node's credential-manager agent and the authority, which assumes the S3 vend role through STS | the same path on sandbox workers when `SPACE_KIND_STORAGE_CREDENTIALS=exchange`, against the object store's STS ([Object-store credentials](#object-store-credentials)). By default, and on builders in every mode, static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch): the authority refuses builder-node callers, whose Kubernetes UID no registration records ([Service identities](#service-identities)) |
+| The authority's STS calls are signed by its workload identity and answered by AWS STS | in `exchange` mode, signed by static keys of the store's vend identity, which may only assume the vend role, and answered by the store itself on its S3 port (`AWS_ENDPOINT_URL_STS`); those keys replace `space-aws-creds`, so its optional AWS integrations are off in that mode. In `static` mode no vend role is configured and the storage exchange is disabled |
+| build-manager gets S3 credentials via credential-manager backed by cloud identity | the store's static root keys in both modes, for the same builder-node reason as volume-manager |
+| cluster-controller reaches S3 with its workload identity   | the store's static root keys as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, in both modes |
 | `/dev/kvm` access via the AMI's kvm group                 | `space-kind-devices.service` makes `/dev/kvm`, `/dev/vhost-vsock` and `/dev/vhost-net` mode 0666 on the node (kind-only; never replicate on a worker) |
 | Loop devices from the AMI's `max_loop=10000` on a real devtmpfs | The node's tmpfs `/dev` starts with 8 nodes; `space-loop-nodes.service` mknods the rest before kubelet, pods copy the node's `/dev`, and node-manager raises its pod's pool further. The cache device has autoclear set, so a node stop releases it (`scripts/lib/space-loop-devices.sh`) |
 | vhost-vsock jail nodes provided by the AMI                | the Kind-only `space-kind-vsock-jails.service` mknods them into each jail under `/space/cache/firecracker/jails` as it appears (kind-only) |
@@ -1562,16 +1568,65 @@ upload). Only reachable after a real restore failure.
 a one-shot Job that creates the `snapshots` and `templates` buckets. The S3
 API is port-forwarded to [localhost:8333](http://localhost:8333).
 
-`space-volmgr-svc` performs real S3 transfers to the object store with static creds
-from the `space-object-store` Secret — both suspend/restore snapshot artifacts
-(`snapshots` bucket) and template pulls (`templates` bucket, populated by the
-`space-seed-publish` Job). See `crates/libs/vol/mgr/server/src/run.rs`.
+`space-volmgr-svc` performs real S3 transfers to the object store — both
+suspend/restore snapshot artifacts (`snapshots` bucket) and template pulls
+(`templates` bucket, populated by the `space-seed-publish` Job) — with the
+credentials the storage credentials mode gives it (below). See
+`crates/libs/vol/mgr/server/src/run.rs`.
 
 Verify the round-trips with the object-store port-forward:
 
 ```bash
 aws --endpoint-url http://localhost:8333 s3 ls s3://snapshots/ --recursive
 aws --endpoint-url http://localhost:8333 s3 ls s3://templates/ --recursive
+```
+
+### Object-store credentials
+
+`SPACE_KIND_STORAGE_CREDENTIALS` selects how node services authenticate to the
+object store, for every bring-up path
+([`lib/storage-credentials.sh`](lib/storage-credentials.sh)):
+
+- `static` (the default): versitygw, whose root keys volume-manager reads from
+  the `space-object-store` Secret. The authority has no vend role, so
+  credential-manager's storage exchange is disabled.
+- `exchange`: the same chart runs SeaweedFS, whose S3 port also answers STS.
+  The authority gets the settings a deployment uses for the exchange: a vend
+  role (`SPACE_CREDMGR_S3_VEND_ROLE_ARN`), base credentials from its AWS
+  default chain, and the STS endpoint through the SDK's
+  `AWS_ENDPOINT_URL_STS`. Sandbox workers' volume-manager gets no object-store
+  keys, so every snapshot and template transfer asks its node's
+  credential-manager agent for a session scoped to that one object. The agent
+  forwards the request to the authority, which checks the caller and the
+  subject's placement and storage, and assumes the vend role with an
+  exact-object session policy. SeaweedFS refuses a session's request for any
+  other object. The vend role's trust policy admits only the vend identity
+  the authority signs with, and that identity has no S3 permission of its
+  own. Builders, build-manager and cluster-controller keep the root keys (see
+  the differences table). The store comparison behind this choice is in
+  [docs/design/kind-storage-exchange.md](../../../docs/design/kind-storage-exchange.md).
+
+Pick the mode when the cluster is created and keep it set for every later
+bring-up and smoke run of that cluster:
+
+```bash
+SPACE_KIND_STORAGE_CREDENTIALS=exchange bash scripts/tests/smoke-kind-e2e.sh
+```
+
+The two stores keep their data in different directories (SeaweedFS's under
+`/var/lib/space-object-store-seaweedfs` on the infra node) and share none, so
+the transition check below refuses a bring-up that would switch an existing
+cluster's mode. The object store's Deployment records its mode in the
+`space.pplx.net/kind-storage-credentials` label.
+
+To see the exchange at work, read the authority's audit events, and confirm
+that the worker volume-manager has no keys:
+
+```bash
+kubectl --context kind-space-local -n space logs deploy/space-credmgr-authority \
+  | grep credential_security_audit | grep ExchangeToken
+kubectl --context kind-space-local -n space get ds space-volume-manager \
+  -o jsonpath='{.spec.template.spec.containers[0].env[*].name}'
 ```
 
 ### Object store transition
@@ -1592,7 +1647,9 @@ run `infra/space/kind/scripts/check-object-store-transition.sh` against an
 existing cluster before they apply anything; when it still has resources from
 the `space-seaweedfs` chart, they list those resources and stop without
 changing anything: the two scripts exit with status 1, and Tilt reports a
-Tiltfile load error. Recreating deletes the cluster's sandboxes,
+Tiltfile load error. The same check refuses a cluster created with the other
+[storage credentials mode](#object-store-credentials), naming the mode it was
+created with. Recreating deletes the cluster's sandboxes,
 snapshots and templates, and keeps the containerd image caches:
 
 ```bash
