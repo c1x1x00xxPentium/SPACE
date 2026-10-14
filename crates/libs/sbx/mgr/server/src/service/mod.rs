@@ -1968,6 +1968,7 @@ mod cleanup_support;
 mod cleanup_targets;
 mod create;
 mod create_support;
+pub(crate) use create_support::template_lookup_scope;
 pub(crate) mod drain;
 mod eviction;
 pub(crate) use eviction::EvictionClaim;

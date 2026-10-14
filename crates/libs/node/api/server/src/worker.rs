@@ -563,7 +563,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         mut r: Request<pplx_space_sbx_mgr_client::proto::CreateRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::CreateResponse>, Status> {
-        crate::template_lookup::bind_caller_scope(&mut r)?;
+        crate::template_lookup::bind_create_caller_scope(&mut r)?;
         // Overrides and nonzero generations require policy authority. A generation
         // persists even without an override and can block later sandbox-specific
         // policy corrections. No override and generation zero retain inheritance.
