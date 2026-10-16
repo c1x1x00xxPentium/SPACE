@@ -1,5 +1,9 @@
 use super::*;
 use crate::runtime_route::{is_refreshable_route_identity_rejection, refresh_dimension_label};
+use std::pin::Pin;
+
+use tokio_util::sync::WaitForCancellationFutureOwned;
+
 use pplx_space_metrics::data_plane::{
     RouteIdentityRefreshOutcome, RouteIdentityRefreshProtocol, ServiceRouteSurface,
     ServiceRouteTransport,
@@ -29,7 +33,15 @@ pub(super) async fn attach_session(
         .parse::<DataPlaneSessionId>()
         .map_err(|_| AttachError::BadRequest("invalid session id"))?;
     let header_token = token_from_headers(&headers)?;
+    if state.drain_started.is_cancelled() {
+        return Ok(native_draining_response(session_id.kind().as_str()));
+    }
+    // Take the tracker token before the upgrade, not inside the callback: the
+    // HTTP connection finishes when the socket is handed off, and the drain
+    // must not see zero tasks in between.
+    let task = state.upgrade_tasks.token();
     Ok(upgrade.on_upgrade(move |socket| async move {
+        let _task = task;
         handle_socket(state, peer.ip(), session_id, header_token, socket).await;
     }))
 }
@@ -55,32 +67,24 @@ pub(super) async fn handle_socket(
         return;
     };
 
-    let token = match header_token {
-        Some(token) => token,
-        None => match first_frame_attach_token(&mut socket, state.attach_deadline).await {
-            Ok(token) => token,
-            Err(error) => {
-                pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), error.as_str());
-                let _ = socket.send(Message::Text(error_json(error).into())).await;
-                let _ = socket.close().await;
-                return;
+    // Authenticating and resolving the route can wait on the client's first
+    // frame, so race it against the drain: a socket that has not attached by
+    // the time the drain starts is told to reconnect at once rather than
+    // holding the drain open.
+    let attached = tokio::select! {
+        biased;
+        () = state.drain_started.cancelled() => None,
+        attached = authenticate_native_socket(&state, session_id, header_token, &mut socket) => {
+            match attached {
+                Some(attached) => Some(attached),
+                None => return,
             }
-        },
-    };
-
-    let attached = match resolve_session_route(&state, session_id, &token).await {
-        Ok(attached) => attached,
-        Err(error) => {
-            pplx_space_metrics::data_plane::attach(
-                session_id.kind().as_str(),
-                error.metric_label(),
-            );
-            let _ = socket
-                .send(Message::Text(error_json(error.frame_code()).into()))
-                .await;
-            let _ = socket.close().await;
-            return;
         }
+    };
+    let Some(attached) = attached.filter(|_| !state.drain_started.is_cancelled()) else {
+        pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), "draining");
+        send_restart_close(&mut socket, DRAINING_CLOSE_REASON).await;
+        return;
     };
     let native_session_permit = match state.native_sessions.try_acquire(session_id, attached.kind) {
         Ok(permit) => permit,
@@ -125,6 +129,44 @@ pub(super) async fn handle_socket(
     let revocation_cache = Arc::clone(&state.revocation_cache);
     bridge_attached_session(state, session_id, attached, socket).await;
     revocation_cache.forget(session_id);
+}
+
+/// Authenticate a native WebSocket and resolve its session route. On failure
+/// the client already has its error frame and the socket is closed.
+async fn authenticate_native_socket(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    header_token: Option<String>,
+    socket: &mut WebSocket,
+) -> Option<AttachedSession> {
+    let token = match header_token {
+        Some(token) => token,
+        None => match first_frame_attach_token(socket, state.attach_deadline).await {
+            Ok(token) => token,
+            Err(error) => {
+                pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), error.as_str());
+                let _ = socket.send(Message::Text(error_json(error).into())).await;
+                let _ = socket.close().await;
+                return None;
+            }
+        },
+    };
+
+    let attached = match resolve_session_route(state, session_id, &token).await {
+        Ok(attached) => attached,
+        Err(error) => {
+            pplx_space_metrics::data_plane::attach(
+                session_id.kind().as_str(),
+                error.metric_label(),
+            );
+            let _ = socket
+                .send(Message::Text(error_json(error.frame_code()).into()))
+                .await;
+            let _ = socket.close().await;
+            return None;
+        }
+    };
+    Some(attached)
 }
 
 pub(super) async fn session_events(
@@ -176,6 +218,9 @@ pub(super) async fn session_events(
         }
         Err(error) => return error.into_response(),
     };
+    if state.drain_started.is_cancelled() {
+        return native_draining_response(session_id.kind().as_str());
+    }
     let last_event_id = match last_event_id(&headers) {
         Ok(last_event_id) => last_event_id,
         Err(message) => {
@@ -200,6 +245,10 @@ pub(super) async fn session_events(
             return route_resolution_http_error(error);
         }
     };
+    // Again after the route lookup: SIGTERM may have landed while it ran.
+    if state.drain_started.is_cancelled() {
+        return native_draining_response(session_id.kind().as_str());
+    }
     let stream_permit = match state.attached_streams.try_acquire_attached(&attached) {
         Ok(permit) => permit,
         Err(limit) => {
@@ -236,16 +285,23 @@ pub(super) async fn session_events(
                     );
                 }
             };
-            match ProcessSseState::new(
-                state,
-                session_id,
-                attached,
-                last_event_id,
-                stream_permit,
-                start_permit,
+            let stream_shutdown_token = state.stream_shutdown_token.clone();
+            let opened = before_stream_deadline(
+                &stream_shutdown_token,
+                ProcessSseState::new(
+                    state,
+                    session_id,
+                    attached,
+                    last_event_id,
+                    stream_permit,
+                    start_permit,
+                ),
             )
-            .await
-            {
+            .await;
+            let Some(opened) = opened else {
+                return native_draining_response(session_id.kind().as_str());
+            };
+            match opened {
                 Ok(stream_state) => SessionSseState::Process(stream_state),
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
@@ -256,9 +312,16 @@ pub(super) async fn session_events(
             }
         }
         SessionKind::FileWatch => {
-            match FileWatchSseState::new(state, session_id, attached, last_event_id, stream_permit)
-                .await
-            {
+            let stream_shutdown_token = state.stream_shutdown_token.clone();
+            let opened = before_stream_deadline(
+                &stream_shutdown_token,
+                FileWatchSseState::new(state, session_id, attached, last_event_id, stream_permit),
+            )
+            .await;
+            let Some(opened) = opened else {
+                return native_draining_response(session_id.kind().as_str());
+            };
+            match opened {
                 Ok(stream_state) => SessionSseState::FileWatch(stream_state),
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
@@ -779,6 +842,9 @@ pub(super) async fn proxy_session(
     let (token, token_source) = token_from_headers_with_source(request.headers())
         .map_err(ProxyError::BadRequest)?
         .ok_or(ProxyError::Unauthorized("data-plane token is required"))?;
+    if is_upgrade_request(request.headers()) && state.drain_started.is_cancelled() {
+        return Ok(native_draining_response(session_id.kind().as_str()));
+    }
     let mut preparation = pplx_space_metrics::data_plane::IngressPreparationObservation::default();
     let mut waiter =
         pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(None)
@@ -806,6 +872,10 @@ pub(super) async fn proxy_session(
     rewrite_proxy_request_for_ingress(&mut request, session_id, token_source)?;
     let kind = attached.kind.as_str();
     let upgrade_stream_permit = if is_upgrade_request(request.headers()) {
+        // Again after the route lookup: SIGTERM may have landed while it ran.
+        if state.drain_started.is_cancelled() {
+            return Ok(native_draining_response(kind));
+        }
         match state.attached_streams.try_acquire_attached(&attached) {
             Ok(permit) => Some(permit),
             Err(limit) => {
@@ -834,38 +904,53 @@ pub(super) async fn proxy_session(
         ServiceRouteSurface::Native,
         ServiceRouteTransport::ServicePortIngress,
     );
-    let mut ingress_io = tokio::time::timeout_at(deadline, async {
-        for attempt in 0..2 {
-            match native_service_port_ingress_io(&state, &attached).await {
-                Ok(io) => {
-                    let fresh = resolve_session_route_with_cache(&state, session_id, &token, false)
-                        .await
-                        .map_err(ProxyError::Route)?;
-                    if fresh.route_identity() == attached.route_identity() {
-                        return Ok(io);
+    let prepared = before_stream_deadline(
+        &state.stream_shutdown_token,
+        tokio::time::timeout_at(deadline, async {
+            for attempt in 0..2 {
+                match native_service_port_ingress_io(&state, &attached).await {
+                    Ok(io) => {
+                        let fresh =
+                            resolve_session_route_with_cache(&state, session_id, &token, false)
+                                .await
+                                .map_err(ProxyError::Route)?;
+                        if fresh.route_identity() == attached.route_identity() {
+                            return Ok(io);
+                        }
+                        attached = fresh;
                     }
-                    attached = fresh;
-                }
-                Err(error) => {
-                    let retryable = error
-                        .transport_status
-                        .as_ref()
-                        .is_some_and(crate::runtime_route::retryable_ingress_attachment);
-                    if attempt == 1 || !retryable {
-                        return Err(ProxyError::Upstream("session service is not reachable"));
+                    Err(error) => {
+                        let retryable = error
+                            .transport_status
+                            .as_ref()
+                            .is_some_and(crate::runtime_route::retryable_ingress_attachment);
+                        if attempt == 1 || !retryable {
+                            return Err(ProxyError::Upstream("session service is not reachable"));
+                        }
+                        attached =
+                            resolve_session_route_with_cache(&state, session_id, &token, false)
+                                .await
+                                .map_err(ProxyError::Route)?;
                     }
-                    attached = resolve_session_route_with_cache(&state, session_id, &token, false)
-                        .await
-                        .map_err(ProxyError::Route)?;
                 }
             }
-        }
-        Err(ProxyError::Upstream(
-            "session route changed during attachment",
-        ))
-    })
-    .await
-    .map_err(|_| ProxyError::Upstream("ingress preparation timed out"))??;
+            Err(ProxyError::Upstream(
+                "session route changed during attachment",
+            ))
+        }),
+    )
+    .await;
+    let Some(prepared) = prepared else {
+        // Only an upgrade is a stream; a plain request is answered as
+        // draining without counting as a refused attach.
+        return Ok(if upgrade_stream_permit.is_some() {
+            native_draining_response(kind)
+        } else {
+            native_draining_error()
+        });
+    };
+    let mut ingress_io =
+        prepared.map_err(|_| ProxyError::Upstream("ingress preparation timed out"))??;
     drop(waiter);
     preparation.ready();
     drop(preparation);
@@ -915,7 +1000,7 @@ pub(super) async fn proxy_session(
     if let (Some(downstream_upgrade), Some(upstream_upgrade), Some(stream_permit)) =
         (downstream_upgrade, upstream_upgrade, upgrade_stream_permit)
     {
-        let shutdown_token = state.shutdown_token.child_token();
+        let shutdown_token = state.stream_shutdown_token.child_token();
         let upgrade_tasks = state.upgrade_tasks.clone();
         upgrade_tasks.spawn(async move {
             let _stream_permit = stream_permit;
@@ -1042,7 +1127,7 @@ pub(super) async fn bridge_attached_session(
         SessionKind::Terminal | SessionKind::Process => {
             let kind = attached.kind.as_str();
             match bridge_process_session(state, session_id, attached, socket).await {
-                Ok(()) => pplx_space_metrics::data_plane::stream_closed(kind, "ok"),
+                Ok(end) => pplx_space_metrics::data_plane::stream_closed(kind, end.result_label()),
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::stream_closed(kind, result);
@@ -1053,7 +1138,7 @@ pub(super) async fn bridge_attached_session(
         SessionKind::FileWatch => {
             let kind = attached.kind.as_str();
             match bridge_file_watch_session(state, session_id, attached, socket).await {
-                Ok(()) => pplx_space_metrics::data_plane::stream_closed(kind, "ok"),
+                Ok(end) => pplx_space_metrics::data_plane::stream_closed(kind, end.result_label()),
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::stream_closed(kind, result);
@@ -1064,7 +1149,7 @@ pub(super) async fn bridge_attached_session(
         SessionKind::Port if attached.target_protocol == Some(SessionTargetProtocol::Tcp) => {
             let kind = attached.kind.as_str();
             match bridge_raw_service_session(state, attached, socket).await {
-                Ok(()) => pplx_space_metrics::data_plane::stream_closed(kind, "ok"),
+                Ok(end) => pplx_space_metrics::data_plane::stream_closed(kind, end.result_label()),
                 Err(error) => {
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::stream_closed(kind, result);
@@ -1085,26 +1170,34 @@ pub(super) async fn bridge_attached_session(
 async fn bridge_raw_service_session(
     state: DataPlaneState,
     mut attached: AttachedSession,
-    socket: WebSocket,
-) -> Result<(), StreamBridgeError> {
+    mut socket: WebSocket,
+) -> Result<BridgeEnd, StreamBridgeError> {
     let session_id = attached.session_id;
-    let ingress_io = native_service_io(&state, &mut attached).await?;
-    let (mut ingress_read, mut ingress_write) = tokio::io::split(ingress_io);
+    let shutdown_token = state.stream_shutdown_token.child_token();
+    // The deadline can pass while the ingress is still opening.
+    let opened = tokio::select! {
+        () = shutdown_token.cancelled() => None,
+        opened = native_service_io(&state, &mut attached) => Some(opened),
+    };
+    let Some(ingress_io) = opened else {
+        send_restart_close(&mut socket, SHUTDOWN_CLOSE_REASON).await;
+        return Ok(BridgeEnd::Shutdown);
+    };
+    let (mut ingress_read, mut ingress_write) = tokio::io::split(ingress_io?);
     let (mut sink, mut source) = socket.split();
     let mut revocation_tick = revocation_check_interval(&state);
-    let shutdown_token = state.shutdown_token.child_token();
     let mut buffer = vec![0_u8; 16 * 1024];
 
     loop {
         tokio::select! {
             _ = shutdown_token.cancelled() => {
-                let _ = sink.close().await;
-                return Ok(());
+                send_restart_close(&mut sink, SHUTDOWN_CLOSE_REASON).await;
+                return Ok(BridgeEnd::Shutdown);
             }
             _ = revocation_tick.tick() => {
                 if session_is_revoked(&state, session_id).await? {
                     let _ = sink.close().await;
-                    return Ok(());
+                    return Ok(BridgeEnd::Completed);
                 }
             }
             message = source.next() => {
@@ -1116,7 +1209,7 @@ async fn bridge_raw_service_session(
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         let _ = ingress_write.shutdown().await;
-                        return Ok(());
+                        return Ok(BridgeEnd::Completed);
                     }
                     Some(Ok(Message::Ping(data))) => {
                         sink.send(Message::Pong(data))
@@ -1138,7 +1231,7 @@ async fn bridge_raw_service_session(
                 })?;
                 if read == 0 {
                     let _ = sink.close().await;
-                    return Ok(());
+                    return Ok(BridgeEnd::Completed);
                 }
                 let data = buffer
                     .get(..read)
@@ -1313,14 +1406,24 @@ pub(super) async fn bridge_process_session(
     session_id: DataPlaneSessionId,
     mut attached: AttachedSession,
     socket: WebSocket,
-) -> Result<(), StreamBridgeError> {
+) -> Result<BridgeEnd, StreamBridgeError> {
+    let shutdown_token = state.stream_shutdown_token.child_token();
     let (mut sink, mut source) = socket.split();
     let open = open_native_process_stream(&state, session_id, &mut attached, None);
-    let (initial, buffered) = match open_while_watching_client(open, &mut source, &mut sink).await {
+    // The deadline can pass while the backend stream is still opening.
+    let opened = tokio::select! {
+        () = shutdown_token.cancelled() => None,
+        opened = open_while_watching_client(open, &mut source, &mut sink) => Some(opened),
+    };
+    let Some(opened) = opened else {
+        send_restart_close(&mut sink, SHUTDOWN_CLOSE_REASON).await;
+        return Ok(BridgeEnd::Shutdown);
+    };
+    let (initial, buffered) = match opened {
         OpenWatch::Opened(initial, buffered) => (initial, buffered),
         // Dropping the open resets the backend stream, which cancels a start
         // that is still queued downstream.
-        OpenWatch::ClientClosed => return Ok(()),
+        OpenWatch::ClientClosed => return Ok(BridgeEnd::Completed),
         // The open may already have passed the guest's start, so a fresh
         // session could run the command twice; only re-attaching this one is
         // safe, which is not what `retryable` tells a client.
@@ -1335,7 +1438,7 @@ pub(super) async fn bridge_process_session(
             )
             .await;
             let _ = sink.close().await;
-            return Ok(());
+            return Ok(BridgeEnd::Completed);
         }
     };
     let mut source = futures_util::stream::iter(buffered.into_iter().map(Ok)).chain(source);
@@ -1354,6 +1457,10 @@ pub(super) async fn bridge_process_session(
 
     loop {
         tokio::select! {
+            () = shutdown_token.cancelled() => {
+                send_restart_close(&mut sink, SHUTDOWN_CLOSE_REASON).await;
+                return Ok(BridgeEnd::Shutdown);
+            }
             _ = revocation_tick.tick() => {
                 if session_is_revoked(&state, session_id).await? {
                     send_server_frame(
@@ -1365,7 +1472,7 @@ pub(super) async fn bridge_process_session(
                     .await
                     .map_err(|_| StreamBridgeError::ClientClosed)?;
                     let _ = sink.close().await;
-                    return Ok(());
+                    return Ok(BridgeEnd::Completed);
                 }
             }
             event = stream.next() => {
@@ -1378,7 +1485,7 @@ pub(super) async fn bridge_process_session(
                     )
                     .await;
                     let _ = sink.close().await;
-                    return Ok(());
+                    return Ok(BridgeEnd::Completed);
                 };
                 match event {
                     Ok(event) => {
@@ -1399,7 +1506,7 @@ pub(super) async fn bridge_process_session(
                         record_process_output_bytes(attached.kind.as_str(), &batch);
                         for frame in batch.frames {
                             if send_server_frame(&mut sink, &frame).await.is_err() {
-                                return Ok(());
+                                return Ok(BridgeEnd::Completed);
                             }
                             if matches!(frame, DataPlaneServerFrame::ProcessExited { .. }) {
                                 let _ = send_server_frame(
@@ -1410,7 +1517,7 @@ pub(super) async fn bridge_process_session(
                                 )
                                 .await;
                                 let _ = sink.close().await;
-                                return Ok(());
+                                return Ok(BridgeEnd::Completed);
                             }
                         }
                     }
@@ -1496,10 +1603,10 @@ pub(super) async fn bridge_process_session(
             }
             message = source.next() => {
                 let Some(message) = message else {
-                    return Ok(());
+                    return Ok(BridgeEnd::Completed);
                 };
                 match message {
-                    Ok(Message::Close(_)) | Err(_) => return Ok(()),
+                    Ok(Message::Close(_)) | Err(_) => return Ok(BridgeEnd::Completed),
                     Ok(Message::Ping(payload)) => {
                         sink.send(Message::Pong(payload)).await.map_err(|_| StreamBridgeError::ClientClosed)?;
                     }
@@ -1578,7 +1685,7 @@ pub(super) async fn bridge_process_session(
                             == ClientFrameAction::Close
                         {
                             let _ = sink.close().await;
-                            return Ok(());
+                            return Ok(BridgeEnd::Completed);
                         }
                     }
                     Ok(Message::Binary(_)) => {
@@ -1917,25 +2024,40 @@ pub(super) async fn bridge_file_watch_session(
     session_id: DataPlaneSessionId,
     mut attached: AttachedSession,
     socket: WebSocket,
-) -> Result<(), StreamBridgeError> {
+) -> Result<BridgeEnd, StreamBridgeError> {
     let watch = file_watch_request(&attached)?;
+    let shutdown_token = state.stream_shutdown_token.child_token();
     let (mut sink, mut source) = socket.split();
+    // The deadline can pass while the backend stream is still opening.
+    let opened = tokio::select! {
+        () = shutdown_token.cancelled() => None,
+        opened = open_native_watch_stream(&state, session_id, &mut attached, watch.clone()) => {
+            Some(opened)
+        }
+    };
+    let Some(opened) = opened else {
+        send_restart_close(&mut sink, SHUTDOWN_CLOSE_REASON).await;
+        return Ok(BridgeEnd::Shutdown);
+    };
     // As for a process: a failed opening, a refusal included, reaches the
     // client as an error frame rather than a dropped socket.
-    let (_client, mut stream) =
-        match open_native_watch_stream(&state, session_id, &mut attached, watch.clone()).await {
-            Ok(opened) => opened,
-            Err(error) => {
-                let _ = send_server_frame(&mut sink, &stream_start_error_frame(&error)).await;
-                let _ = sink.close().await;
-                return Err(error);
-            }
-        };
+    let (_client, mut stream) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            let _ = send_server_frame(&mut sink, &stream_start_error_frame(&error)).await;
+            let _ = sink.close().await;
+            return Err(error);
+        }
+    };
     let mut event_seq = 0_u64;
     let mut revocation_tick = revocation_check_interval(&state);
 
     loop {
         tokio::select! {
+            () = shutdown_token.cancelled() => {
+                send_restart_close(&mut sink, SHUTDOWN_CLOSE_REASON).await;
+                return Ok(BridgeEnd::Shutdown);
+            }
             _ = revocation_tick.tick() => {
                 if session_is_revoked(&state, session_id).await? {
                     send_server_frame(
@@ -1947,7 +2069,7 @@ pub(super) async fn bridge_file_watch_session(
                     .await
                     .map_err(|_| StreamBridgeError::ClientClosed)?;
                     let _ = sink.close().await;
-                    return Ok(());
+                    return Ok(BridgeEnd::Completed);
                 }
             }
             event = stream.next() => {
@@ -1960,14 +2082,14 @@ pub(super) async fn bridge_file_watch_session(
                     )
                     .await;
                     let _ = sink.close().await;
-                    return Ok(());
+                    return Ok(BridgeEnd::Completed);
                 };
                 match event {
                     Ok(event) => {
                         event_seq = event_seq.saturating_add(1);
                         let frame = file_event_frame(event, event_seq);
                         if send_server_frame(&mut sink, &frame).await.is_err() {
-                            return Ok(());
+                            return Ok(BridgeEnd::Completed);
                         }
                     }
                     Err(status) => {
@@ -2050,10 +2172,10 @@ pub(super) async fn bridge_file_watch_session(
             }
             message = source.next() => {
                 let Some(message) = message else {
-                    return Ok(());
+                    return Ok(BridgeEnd::Completed);
                 };
                 match message {
-                    Ok(Message::Close(_)) | Err(_) => return Ok(()),
+                    Ok(Message::Close(_)) | Err(_) => return Ok(BridgeEnd::Completed),
                     Ok(Message::Ping(payload)) => {
                         sink.send(Message::Pong(payload)).await.map_err(|_| StreamBridgeError::ClientClosed)?;
                     }
@@ -2062,7 +2184,7 @@ pub(super) async fn bridge_file_watch_session(
                             == ClientFrameAction::Close
                         {
                             let _ = sink.close().await;
-                            return Ok(());
+                            return Ok(BridgeEnd::Completed);
                         }
                     }
                     Ok(Message::Binary(_)) => {
@@ -2115,6 +2237,7 @@ pub(super) struct ProcessSseState {
     revocation_tick: tokio::time::Interval,
     pending: VecDeque<Event>,
     finished: bool,
+    shutdown: Pin<Box<WaitForCancellationFutureOwned>>,
     start_permit: Option<NativeSessionAttachPermit>,
     _stream_permit: AttachedStreamPermit,
 }
@@ -2199,6 +2322,7 @@ impl ProcessSseState {
         let backend_output_cursor = replay
             .backend_output_cursor
             .or_else(|| attached.backend_process_id.is_none().then_some(0));
+        let shutdown = Box::pin(state.stream_shutdown_token.child_token().cancelled_owned());
 
         Ok(Self {
             state,
@@ -2213,6 +2337,7 @@ impl ProcessSseState {
             revocation_tick,
             pending,
             finished: false,
+            shutdown,
             start_permit,
             _stream_permit: stream_permit,
         })
@@ -2230,8 +2355,7 @@ impl ProcessSseState {
     }
 
     fn finish_with_frame(&mut self, frame: DataPlaneServerFrame, result: &'static str) {
-        pplx_space_metrics::data_plane::stream_closed(self.session_id.kind().as_str(), result);
-        self.finished = true;
+        self.finish(result);
         self.push_frame(frame);
     }
 
@@ -2266,6 +2390,12 @@ pub(super) async fn next_process_sse_event(
 
     loop {
         tokio::select! {
+            () = state.shutdown.as_mut() => {
+                // The drain deadline passed. Ending the body lets the client
+                // reconnect elsewhere with `Last-Event-ID`.
+                state.finish("shutdown");
+                return None;
+            }
             _ = state.revocation_tick.tick() => {
                 match session_is_revoked(&state.state, state.session_id).await {
                     Ok(true) => {
@@ -2463,6 +2593,7 @@ pub(super) struct FileWatchSseState {
     revocation_tick: tokio::time::Interval,
     pending: VecDeque<Event>,
     finished: bool,
+    shutdown: Pin<Box<WaitForCancellationFutureOwned>>,
     _stream_permit: AttachedStreamPermit,
 }
 
@@ -2489,6 +2620,7 @@ impl FileWatchSseState {
             pending.push_back(sse_event_from_frame(&frame, Some(event_seq)));
         }
         let revocation_tick = revocation_check_interval(&state);
+        let shutdown = Box::pin(state.stream_shutdown_token.child_token().cancelled_owned());
 
         Ok(Self {
             state,
@@ -2501,6 +2633,7 @@ impl FileWatchSseState {
             revocation_tick,
             pending,
             finished: false,
+            shutdown,
             _stream_permit: stream_permit,
         })
     }
@@ -2511,9 +2644,13 @@ impl FileWatchSseState {
             .push_back(sse_event_from_frame(&frame, Some(self.event_seq)));
     }
 
-    fn finish_with_frame(&mut self, frame: DataPlaneServerFrame, result: &'static str) {
+    fn finish(&mut self, result: &'static str) {
         pplx_space_metrics::data_plane::stream_closed(self.session_id.kind().as_str(), result);
         self.finished = true;
+    }
+
+    fn finish_with_frame(&mut self, frame: DataPlaneServerFrame, result: &'static str) {
+        self.finish(result);
         self.push_frame(frame);
     }
 
@@ -2548,6 +2685,12 @@ pub(super) async fn next_file_watch_sse_event(
 
     loop {
         tokio::select! {
+            () = state.shutdown.as_mut() => {
+                // The drain deadline passed. Ending the body lets the client
+                // reconnect elsewhere with `Last-Event-ID`.
+                state.finish("shutdown");
+                return None;
+            }
             _ = state.revocation_tick.tick() => {
                 match session_is_revoked(&state.state, state.session_id).await {
                     Ok(true) => {

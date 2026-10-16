@@ -44,11 +44,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::OwnedMutexGuard;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use super::{
-    AttachedStreamPermit, BackendEndpoint, DataPlaneState, ECW_PROCESS_STREAM_KIND, EcwProxyError,
-    EcwResolvedRoute, acquire_ecw_stream_permit, ecw_backend_channel, ecw_connect,
-    node_api_request_with_route_token_state, optional_header, resolve_ecw_envd_route,
+    AttachedStreamPermit, BackendEndpoint, DataPlaneState, ECW_PROCESS_INPUT_STREAM_KIND,
+    ECW_PROCESS_STREAM_KIND, EcwProxyError, EcwResolvedRoute, acquire_ecw_stream_permit,
+    before_stream_deadline, ecw_backend_channel, ecw_connect,
+    node_api_request_with_route_token_state, optional_header, refuse_new_ecw_stream_while_draining,
+    resolve_ecw_envd_route,
 };
 use crate::runtime_route::{
     EcwRouteAttemptError, bounded_ecw_route_call_with_timeout_observer, bounded_node_api_unary,
@@ -281,6 +284,7 @@ pub(super) async fn process_start(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, EcwProxyError> {
+    refuse_new_ecw_stream_while_draining(&state, ECW_PROCESS_STREAM_KIND)?;
     let route = resolve_ecw_envd_route(&state, &headers).await?;
     let request: ProcessStartConnectRequestE2b =
         ecw_connect::decode_connect_json_request(body).await?;
@@ -302,6 +306,12 @@ pub(super) async fn process_start(
     let stall_after = process_stream_stall_after(command_timeout);
     let open_timeout = process_stream_open_timeout(command_timeout);
     let resume_request = native_request.clone();
+    // Not raced against the drain deadline: the guest may already be running
+    // the command, so the open runs to its own timeout and the stream reports
+    // the start (ProcessConnectJsonStream waits for it after the deadline).
+    // New starts are refused once the drain begins, so an open still running
+    // was admitted before SIGTERM and ends within the 8-second stream-open
+    // budget, before any deadline of at least that long.
     let ((stream, retried_start), route) = open_process_start_stream_with_refresh(
         &state,
         route,
@@ -367,7 +377,10 @@ pub(super) async fn process_start(
         &route,
         stdout_stream,
         stall_after,
-        stream_permit,
+        EcwProcessStreamLease {
+            permit: stream_permit,
+            shutdown_token: state.stream_shutdown_token.child_token(),
+        },
     ))
 }
 
@@ -376,6 +389,7 @@ pub(super) async fn process_connect(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, EcwProxyError> {
+    refuse_new_ecw_stream_while_draining(&state, ECW_PROCESS_STREAM_KIND)?;
     let route = resolve_ecw_envd_route(&state, &headers).await?;
     let request: ProcessConnectRequestE2b = ecw_connect::decode_connect_json_request(body).await?;
     let process = process_for_selector(&state, &route, request.process).await?;
@@ -394,43 +408,54 @@ pub(super) async fn process_connect(
         }),
     };
     let route_state = state.clone();
-    let (stream, route) = bounded_ecw_route_call_with_timeout_observer(
-        &state,
-        route,
-        "process_connect_open",
-        open_timeout,
-        Some(log_process_connect_timeout),
-        move |route, _remaining| {
-            let message = message.clone();
-            let state = route_state.clone();
-            async move {
-                let channel = ecw_backend_channel(&state, &route)
-                    .await
-                    .map_err(EcwRouteAttemptError::Proxy)?;
-                let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
-                let result = client
-                    .spaced_connect_process(node_api_request_with_route_token_state(
-                        message,
-                        route.space_api_route_token.as_ref(),
-                    )?)
-                    .await
-                    .map(|response| response.into_inner());
-                if let Err(status) = &result {
-                    log_process_stream_open_status("Process.Connect", &route, status);
+    let opened = before_stream_deadline(
+        &state.stream_shutdown_token,
+        bounded_ecw_route_call_with_timeout_observer(
+            &state,
+            route,
+            "process_connect_open",
+            open_timeout,
+            Some(log_process_connect_timeout),
+            move |route, _remaining| {
+                let message = message.clone();
+                let state = route_state.clone();
+                async move {
+                    let channel = ecw_backend_channel(&state, &route)
+                        .await
+                        .map_err(EcwRouteAttemptError::Proxy)?;
+                    let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
+                    let result = client
+                        .spaced_connect_process(node_api_request_with_route_token_state(
+                            message,
+                            route.space_api_route_token.as_ref(),
+                        )?)
+                        .await
+                        .map(|response| response.into_inner());
+                    if let Err(status) = &result {
+                        log_process_stream_open_status("Process.Connect", &route, status);
+                    }
+                    result.map_err(EcwRouteAttemptError::Status)
                 }
-                result.map_err(EcwRouteAttemptError::Status)
-            }
-        },
-        ecw_connect::tonic_status_to_ecw_error,
+            },
+            ecw_connect::tonic_status_to_ecw_error,
+        ),
     )
-    .await?;
+    .await;
+    let Some(opened) = opened else {
+        pplx_space_metrics::data_plane::attach(ECW_PROCESS_STREAM_KIND, "draining");
+        return Err(EcwProxyError::draining());
+    };
+    let (stream, route) = opened?;
 
     Ok(process_connect_json_stream_response(
         stream,
         &route,
         stdout_stream,
         stall_after,
-        stream_permit,
+        EcwProcessStreamLease {
+            permit: stream_permit,
+            shutdown_token: state.stream_shutdown_token.child_token(),
+        },
     ))
 }
 
@@ -527,27 +552,45 @@ pub(super) async fn process_stream_input(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<EmptyUnaryConnectResponseE2b>, EcwProxyError> {
+    let streaming = is_connect_json_stream_request(&headers);
+    // A streamed input request stays open as long as its client keeps
+    // sending, so the drain treats it as a stream; the unary form is served.
+    if streaming {
+        refuse_new_ecw_stream_while_draining(&state, ECW_PROCESS_INPUT_STREAM_KIND)?;
+    }
     let mut route = resolve_ecw_envd_route(&state, &headers).await?;
     let mut process_id = None::<String>;
     let mut input_guard = None::<OwnedMutexGuard<()>>;
 
-    if is_connect_json_stream_request(&headers) {
-        let mut body = body;
-        let mut buffer = Vec::new();
-        let mut seen_message = false;
-        while let Some(request) =
-            ecw_connect::decode_next_connect_json_stream_message(&mut body, &mut buffer).await?
-        {
-            seen_message = true;
-            handle_process_stream_input_request(
-                &state,
-                &mut route,
-                &mut process_id,
-                &mut input_guard,
-                request,
-            )
-            .await?;
-        }
+    if streaming {
+        // Again after the route lookup: SIGTERM may have landed while it ran.
+        refuse_new_ecw_stream_while_draining(&state, ECW_PROCESS_INPUT_STREAM_KIND)?;
+        let shutdown_token = state.stream_shutdown_token.child_token();
+        let input = async {
+            let mut body = body;
+            let mut buffer = Vec::new();
+            let mut seen_message = false;
+            while let Some(request) =
+                ecw_connect::decode_next_connect_json_stream_message(&mut body, &mut buffer).await?
+            {
+                seen_message = true;
+                handle_process_stream_input_request(
+                    &state,
+                    &mut route,
+                    &mut process_id,
+                    &mut input_guard,
+                    request,
+                )
+                .await?;
+            }
+            Ok::<_, EcwProxyError>(seen_message)
+        };
+        // The deadline ends the stream whether it is waiting for the client's
+        // next message or for a backend call on the last one.
+        let seen_message = tokio::select! {
+            () = shutdown_token.cancelled() => return Err(EcwProxyError::input_interrupted()),
+            seen_message = input => seen_message?,
+        };
         if !seen_message {
             return Err(EcwProxyError::bad_request("Empty Connect stream"));
         }
@@ -799,7 +842,7 @@ fn process_connect_json_stream_response<S>(
     route: &EcwResolvedRoute,
     stdout_stream: ecw_connect::EcwProcessStdoutStream,
     stall_after: Option<Duration>,
-    stream_permit: AttachedStreamPermit,
+    lease: EcwProcessStreamLease,
 ) -> Response
 where
     S: Stream<Item = Result<SpacedProcessEvent, tonic::Status>> + Send + 'static,
@@ -811,7 +854,7 @@ where
         true,
         stdout_stream,
         stall_after,
-        stream_permit,
+        lease,
     ))
 }
 
@@ -820,7 +863,7 @@ fn process_start_json_stream_response<S>(
     route: &EcwResolvedRoute,
     stdout_stream: ecw_connect::EcwProcessStdoutStream,
     stall_after: Option<Duration>,
-    stream_permit: AttachedStreamPermit,
+    lease: EcwProcessStreamLease,
 ) -> Response
 where
     S: Stream<Item = Result<SpacedProcessEvent, tonic::Status>> + Send + 'static,
@@ -832,7 +875,7 @@ where
         false,
         stdout_stream,
         stall_after,
-        stream_permit,
+        lease,
     ))
 }
 
@@ -1443,7 +1486,7 @@ fn process_connect_json_stream<S>(
     connected_as_start: bool,
     stdout_stream: ecw_connect::EcwProcessStdoutStream,
     stall_after: Option<Duration>,
-    stream_permit: AttachedStreamPermit,
+    lease: EcwProcessStreamLease,
 ) -> ProcessConnectJsonStream<S>
 where
     S: Stream<Item = Result<SpacedProcessEvent, tonic::Status>>,
@@ -1461,8 +1504,19 @@ where
         close_recorded: false,
         stall_after,
         stall_deadline: stall_after.map(|after| Box::pin(tokio::time::sleep(after))),
-        _stream_permit: stream_permit,
+        shutdown: Box::pin(lease.shutdown_token.cancelled_owned()),
+        flushed_after_shutdown: None,
+        delivered_any: false,
+        start_wait: None,
+        _stream_permit: lease.permit,
     }
+}
+
+/// What bounds an ECW process stream's lifetime: the attached-stream slot it
+/// holds, and the token that ends it at the drain deadline.
+struct EcwProcessStreamLease {
+    permit: AttachedStreamPermit,
+    shutdown_token: CancellationToken,
 }
 
 struct ProcessConnectJsonStream<S> {
@@ -1478,10 +1532,56 @@ struct ProcessConnectJsonStream<S> {
     close_recorded: bool,
     stall_after: Option<Duration>,
     stall_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    shutdown: Pin<Box<WaitForCancellationFutureOwned>>,
+    /// What has been delivered since the drain deadline passed, or `None`
+    /// before it.
+    flushed_after_shutdown: Option<ShutdownFlush>,
+    /// Whether any message reached the client, so a start knows whether it
+    /// has reported itself yet.
+    delivered_any: bool,
+    /// How long a start that has not reported itself waits after the deadline.
+    start_wait: Option<Pin<Box<tokio::time::Sleep>>>,
     _stream_permit: AttachedStreamPermit,
 }
 
+/// Messages and bytes a process stream has delivered after the drain deadline.
+#[derive(Default)]
+struct ShutdownFlush {
+    messages: usize,
+    bytes: usize,
+}
+
+impl ShutdownFlush {
+    fn exhausted(&self) -> bool {
+        self.messages >= SHUTDOWN_FLUSH_LIMIT || self.bytes >= SHUTDOWN_FLUSH_BYTES
+    }
+}
+
+/// Messages and bytes a process stream may still deliver after the drain
+/// deadline before it ends regardless, so a stream that never goes idle stops
+/// producing. The cap bounds the work, not the time: a client too slow to
+/// take the flush within the 5-second cancel grace is cut by the process exit
+/// without the end-stream message.
+const SHUTDOWN_FLUSH_LIMIT: usize = 64;
+const SHUTDOWN_FLUSH_BYTES: usize = 1024 * 1024;
+/// How long a start that hasn't reported itself yet waits for its first
+/// message once the stream sees the deadline, leaving the rest of the
+/// 5-second cancel grace to deliver it.
+const SHUTDOWN_START_WAIT: Duration = Duration::from_secs(2);
+
 impl<S> ProcessConnectJsonStream<S> {
+    fn end_for_shutdown(&mut self) -> Bytes {
+        self.ended = true;
+        self.record_close("shutdown");
+        let bytes = if !self.connected_as_start && !self.delivered_any {
+            ecw_connect::connect_unreported_start_end_stream()
+        } else {
+            ecw_connect::connect_shutdown_end_stream()
+        };
+        record_ecw_process_stream_bytes(&bytes);
+        bytes
+    }
+
     fn record_close(&mut self, result: &'static str) {
         if self.close_recorded {
             return;
@@ -1510,6 +1610,21 @@ where
         if this.ended {
             return Poll::Ready(None);
         }
+        // At the drain deadline, first deliver what the backend has already
+        // produced: a start that completed just before the deadline still
+        // reaches the client as `start`, so it does not retry a command that
+        // ran. The cap keeps a stream that never goes idle from outliving the
+        // deadline.
+        if this.flushed_after_shutdown.is_none() && this.shutdown.as_mut().poll(cx).is_ready() {
+            this.flushed_after_shutdown = Some(ShutdownFlush::default());
+        }
+        if this
+            .flushed_after_shutdown
+            .as_ref()
+            .is_some_and(ShutdownFlush::exhausted)
+        {
+            return Poll::Ready(Some(Ok(this.end_for_shutdown())));
+        }
 
         loop {
             match this.inner.as_mut().poll_next(cx) {
@@ -1519,6 +1634,11 @@ where
                         this.connected_as_start,
                         this.stdout_stream,
                     ) {
+                        if let Some(flushed) = this.flushed_after_shutdown.as_mut() {
+                            flushed.messages += 1;
+                            flushed.bytes += bytes.len();
+                        }
+                        this.delivered_any = true;
                         record_ecw_process_stream_bytes(&bytes);
                         return Poll::Ready(Some(Ok(bytes)));
                     }
@@ -1537,6 +1657,19 @@ where
                     let bytes = ecw_connect::connect_json_message(serde_json::json!({}), true);
                     record_ecw_process_stream_bytes(&bytes);
                     return Poll::Ready(Some(Ok(bytes)));
+                }
+                Poll::Pending if this.flushed_after_shutdown.is_some() => {
+                    // A start whose guest command may already be running waits
+                    // briefly for it to report itself, within the cancel grace.
+                    if !this.connected_as_start && !this.delivered_any {
+                        let wait = this.start_wait.get_or_insert_with(|| {
+                            Box::pin(tokio::time::sleep(SHUTDOWN_START_WAIT))
+                        });
+                        if wait.as_mut().poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                    }
+                    return Poll::Ready(Some(Ok(this.end_for_shutdown())));
                 }
                 Poll::Pending => {
                     if let Some(deadline) = this.stall_deadline.as_mut()

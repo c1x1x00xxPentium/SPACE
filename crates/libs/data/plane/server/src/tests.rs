@@ -890,7 +890,8 @@ pub(crate) async fn test_data_plane_state() -> DataPlaneState {
         ecw_hosts: EcwHostConfig::default(),
         revocation_check_interval: Duration::from_secs(1),
         route_cache_ttl: Duration::from_secs(60),
-        shutdown_token: CancellationToken::new(),
+        drain_started: CancellationToken::new(),
+        stream_shutdown_token: CancellationToken::new(),
         upgrade_tasks: TaskTracker::new(),
     }
 }
@@ -4079,7 +4080,7 @@ async fn cached_ingress_refreshes_replaced_execution_but_not_denied_access() {
             assert_eq!(opens.load(Ordering::SeqCst), 1);
             assert_eq!(resolves.load(Ordering::SeqCst), 0);
         }
-        state.shutdown_token.cancel();
+        state.stream_shutdown_token.cancel();
         server.abort();
     }
 }

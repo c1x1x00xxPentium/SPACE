@@ -7,8 +7,8 @@ use pplx_space_data_plane_server::{
     DEFAULT_MAX_ATTACHED_STREAMS, DEFAULT_MAX_ATTACHED_STREAMS_PER_ORG,
     DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX, DEFAULT_MAX_CONCURRENT_UPLOADS,
     DEFAULT_MAX_IN_FLIGHT_UPLOAD_BYTES, DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
-    DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP,
-    DEFAULT_UPLOAD_ADMISSION_WAIT, DataPlaneConfig, UploadAdmissionConfig,
+    DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_SHUTDOWN_GRACE, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP,
+    DEFAULT_UPLOAD_ADMISSION_WAIT, DataPlaneConfig, MIN_SHUTDOWN_GRACE, UploadAdmissionConfig,
 };
 
 // Same allocator choice as space-api-svc: glibc arenas keep the peak of an
@@ -123,6 +123,18 @@ struct Cli {
         default_value_t = DEFAULT_UPLOAD_ADMISSION_WAIT.as_millis() as u64
     )]
     upload_admission_wait_ms: u64,
+
+    /// Maximum seconds live streams may keep running after SIGTERM before they
+    /// are cancelled. Keep it plus 5 seconds, which cancelled streams get to
+    /// close, within the pod's termination grace period minus its preStop
+    /// delay.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_SHUTDOWN_GRACE_SECS",
+        default_value_t = DEFAULT_SHUTDOWN_GRACE.as_secs(),
+        value_parser = clap::value_parser!(u64).range(MIN_SHUTDOWN_GRACE.as_secs()..)
+    )]
+    shutdown_grace_secs: u64,
 }
 
 impl From<Cli> for DataPlaneConfig {
@@ -144,6 +156,7 @@ impl From<Cli> for DataPlaneConfig {
                 max_in_flight_bytes: cli.max_in_flight_upload_bytes,
                 wait: Duration::from_millis(cli.upload_admission_wait_ms),
             }),
+            shutdown_grace: Duration::from_secs(cli.shutdown_grace_secs),
         }
     }
 }
