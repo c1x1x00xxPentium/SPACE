@@ -564,7 +564,7 @@ async fn existing_rows_are_classified_exhaustively_through_executor() -> TestRes
         (
             SandboxLifecycle::Creating,
             SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
+            OperationState::Queued,
         ),
         (
             SandboxLifecycle::Starting,
@@ -866,6 +866,44 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
     assert_eq!(
         pinned_value.get("node_pool").and_then(|v| v.as_str()),
         Some("isolated-test-pool")
+    );
+}
+
+#[test]
+fn lifecycle_operation_payload_is_wire_compatible_with_old_shape() {
+    let sandbox_id = PublicSandboxId::new();
+    let ordinary = SandboxLifecycleOperationPayload {
+        sandbox_id,
+        action: SandboxLifecycleAction::Delete,
+        rollback: None,
+        create_rollback_fence: None,
+    };
+    let ordinary_value = ordinary.into_json();
+    assert!(
+        ordinary_value.get("create_rollback_fence").is_none(),
+        "user DELETE payloads must remain byte-compatible with old consumers"
+    );
+
+    let old_shape = serde_json::json!({
+        "sandbox_id": sandbox_id,
+        "action": "delete"
+    });
+    let decoded: SandboxLifecycleOperationPayload = serde_json::from_value(old_shape).unwrap();
+    assert!(decoded.create_rollback_fence.is_none());
+
+    let compensation = SandboxLifecycleOperationPayload {
+        sandbox_id,
+        action: SandboxLifecycleAction::Delete,
+        rollback: None,
+        create_rollback_fence: Some(CreateRollbackExecutionFence::Direct {
+            node_id: NodeId::new(),
+            route_identity: None,
+        }),
+    }
+    .into_json();
+    assert!(
+        compensation.get("create_rollback_fence").is_some(),
+        "create compensation must persist the execution fence it re-proves on every attempt"
     );
 }
 

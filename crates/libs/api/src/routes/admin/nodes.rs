@@ -897,21 +897,25 @@ async fn apply_drain_action(
     // occupancy. The check happens under the same `FOR UPDATE` lock as the phase
     // write, so it and the write agree on one snapshot.
     //
-    // **That lock does not order every writer, and this guard is not a fence.**
-    // It only orders transactions that themselves lock this `nodes` row.
-    // `sandboxes.active_node_id` has no FK to `nodes(id)`, and the pooled
-    // post-wake, post-create placement, pooled-create, and direct-restore
-    // writers set it without touching `nodes` — so a placement can commit
-    // immediately after this transaction does, on a node this endpoint has just
-    // moved to `terminating`. Nothing on the `terminating` path consults the
-    // resident guard again (it rides the `drained → terminating` edge), so before
-    // the recheck described below that sandbox died with the instance.
-    // `node_drain::handle_terminating_node` now recounts the terminator's
-    // blocking set immediately before the provider terminate call and reverts to
-    // `drained` instead, which turns the common case into a park — but the
-    // microseconds between that recount and the provider call are still exposed.
-    // A fence honoured by every placement writer and the provider-termination
-    // path would be needed to close that race.
+    // **That lock is the terminate half of the termination fence.** A row lock
+    // orders only transactions that also lock this row, and
+    // `sandboxes.active_node_id` has no FK to `nodes(id)`, so for a while this
+    // guard ordered nothing against the pooled post-wake, post-create placement,
+    // pooled-create, and direct-restore writers: a placement could commit right
+    // after this transaction did, onto a node this endpoint had just moved to
+    // `terminating`, and nothing on the `terminating` path consults the resident
+    // guard again (it rides the `drained → terminating` edge), so that sandbox
+    // died with the instance.
+    //
+    // The other half now exists. Every *live* writer of `active_node_id` takes
+    // `FOR KEY SHARE` on this row through
+    // `pplx_space_common_svc::sql::node_placement_fence` and refuses a committed
+    // `drained` or `terminating`, so the two orders are both covered: a placement
+    // that gets here first is seen by the occupancy count below (taken under this
+    // lock, in a later statement, so its snapshot is fresh), and one that arrives
+    // after reads the phase this transaction wrote and abandons its write. That
+    // module's docs carry why the lock is `FOR KEY SHARE`, which phases fence,
+    // and what the fence still does not cover.
     //
     // * `local_snapshots` — a suspended sandbox may retain its only snapshot
     //   on the node named by `target_node_id`; terminating would strand it.

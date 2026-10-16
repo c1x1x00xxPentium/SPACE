@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use pplx_space_common_core::types::{
-    NodeId, NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
+    NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
 };
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_public_api::{
@@ -22,6 +22,7 @@ use crate::controllers::ControllerError;
 use crate::controllers::sandbox::FederatedSandboxCreateContext;
 use crate::controllers::sandbox::lifecycle::SandboxAction;
 use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
+use crate::controllers::substrate::CreateRollbackExecutionFence;
 use crate::models::{
     CreateSandboxRequest as ControllerCreateSandboxRequest, SandboxMetadata,
     SandboxMetadataValue as ControllerSandboxMetadataValue,
@@ -118,6 +119,27 @@ pub struct SandboxLifecycleOperationPayload {
     pub action: SandboxLifecycleAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<RollbackSandboxRequest>,
+    /// The exact execution a create started, present exactly on a
+    /// [`OperationKind::CompensateCreateSandbox`] operation.
+    ///
+    /// Create compensation must not use the user DELETE contract, which
+    /// retires the control-plane row after most unconfirmed node failures, and
+    /// a stable sandbox id alone does not name what to tear down: a restore or
+    /// wake can replace the execution while the operation is queued. So the
+    /// strict teardown re-proves this fence on every attempt.
+    ///
+    /// One exception is worth knowing. The `Delete` arm below returns "sandbox
+    /// already deleted" for a missing `sandboxes` row *before* it reaches the
+    /// strict teardown, so a compensation whose row another writer retired (a
+    /// best-effort user DELETE against an unreachable node) reports success
+    /// having made no node call.
+    ///
+    /// Skipped when absent, so user lifecycle payloads serialize exactly as
+    /// before and a controller that predates this field still decodes them.
+    /// Only compensation operations carry it, and claims select by kind, so a
+    /// controller that predates the kind never sees one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_rollback_fence: Option<CreateRollbackExecutionFence>,
 }
 
 impl SandboxLifecycleOperationPayload {
@@ -388,7 +410,7 @@ impl CreateSandboxOperationExecutor {
                 ));
             }
             let lifecycle = existing.lifecycle.parse::<SandboxLifecycle>()?;
-            ensure_existing_row_confirms_create(existing.active_node_id, lifecycle)?;
+            ensure_existing_row_confirms_create(lifecycle)?;
             return Ok(create_success_result(
                 payload.sandbox_id,
                 lifecycle,
@@ -511,7 +533,13 @@ impl SandboxLifecycleOperationExecutor {
                 payload_sandbox_id: payload.sandbox_id,
             });
         }
-        if payload.action.operation_kind() != operation.kind {
+        let compensation = operation.kind == OperationKind::CompensateCreateSandbox;
+        let expected_kind = if compensation && payload.action == SandboxLifecycleAction::Delete {
+            OperationKind::CompensateCreateSandbox
+        } else {
+            payload.action.operation_kind()
+        };
+        if expected_kind != operation.kind {
             return Err(SandboxLifecycleExecutionError::KindMismatch {
                 operation_kind: operation.kind,
                 action: payload.action,
@@ -540,9 +568,19 @@ impl SandboxLifecycleOperationExecutor {
                     "sandbox already deleted",
                 ));
             }
-            self.controller
-                .delete_control_plane(&self.pool, sandbox_uuid.into(), sandbox.as_ref())
-                .await?;
+            if compensation {
+                let fence = payload
+                    .create_rollback_fence
+                    .as_ref()
+                    .ok_or(SandboxLifecycleExecutionError::MissingCreateRollbackFence)?;
+                self.controller
+                    .delete_created_sandbox_for_rollback(&self.pool, sandbox_uuid.into(), fence)
+                    .await?;
+            } else {
+                self.controller
+                    .delete_control_plane(&self.pool, sandbox_uuid.into(), sandbox.as_ref())
+                    .await?;
+            }
             return Ok(lifecycle_success_result(
                 payload.sandbox_id,
                 payload.action,
@@ -751,11 +789,14 @@ pub(crate) fn create_success_result(
 /// finish creating. The explicit match makes new lifecycle variants fail to
 /// compile until their create-operation disposition is chosen deliberately.
 fn ensure_existing_row_confirms_create(
-    active_node_id: Option<NodeId>,
     lifecycle: SandboxLifecycle,
 ) -> Result<(), CreateSandboxExecutionError> {
     match lifecycle {
-        SandboxLifecycle::Creating if active_node_id.is_none() => Err(
+        // Placement is not completion. A rollback can claim a live execution
+        // after its node was recorded but before create finalized, so treating
+        // `creating` + `active_node_id` as success lets a stale create claim
+        // race and report success for a sandbox already owned by compensation.
+        SandboxLifecycle::Creating => Err(
             CreateSandboxExecutionError::ExistingRowNotCreateSuccess(lifecycle),
         ),
         SandboxLifecycle::Deleting | SandboxLifecycle::Quarantined | SandboxLifecycle::Failed => {
@@ -764,7 +805,6 @@ fn ensure_existing_row_confirms_create(
             ))
         }
         SandboxLifecycle::Created
-        | SandboxLifecycle::Creating
         | SandboxLifecycle::Starting
         | SandboxLifecycle::Started
         | SandboxLifecycle::Restoring
@@ -928,6 +968,8 @@ enum SandboxLifecycleExecutionError {
     MissingRollbackRequest,
     #[error("rollback action is missing snapshot_name")]
     MissingRollbackSnapshotName,
+    #[error("create rollback delete is missing its execution fence")]
+    MissingCreateRollbackFence,
     #[error("unsupported sandbox lifecycle action '{0}'")]
     UnsupportedAction(SandboxLifecycleAction),
     #[error("unknown sandbox lifecycle: {0}")]
@@ -948,6 +990,7 @@ impl SandboxLifecycleExecutionError {
             | Self::TargetOrgMismatch
             | Self::MissingRollbackRequest
             | Self::MissingRollbackSnapshotName
+            | Self::MissingCreateRollbackFence
             | Self::UnsupportedAction(_)
             | Self::UnknownLifecycle(_) => PublicOperationExecutionResult::failed(
                 "sandbox lifecycle operation is invalid",

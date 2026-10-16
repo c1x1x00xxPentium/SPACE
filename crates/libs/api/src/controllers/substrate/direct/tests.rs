@@ -777,6 +777,50 @@ async fn postgres_fixture() -> TestResult<Option<PostgresFixture>> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn direct_delete_uses_route_identity_before_active_placement_is_committed() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let node_id = NodeId::new();
+    let activation_attempt_id = Uuid::now_v7();
+    let (server, state) = start_sim_worker(node_id).await?;
+    insert_sandbox(&fixture.pool, sandbox_id, None).await?;
+    insert_ready_worker(&fixture.pool, node_id, server.endpoint(), "9.0.0").await?;
+    state
+        .insert_new(creating_record(sandbox_id).with_route_identity_provenance(1, 1, None))
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_direct_route_identities (
+             sandbox_id,
+             route_generation,
+             current_node_id,
+             substrate_kind,
+             execution_generation,
+             activation_attempt_id
+         )
+         VALUES ($1, 1, $2, 'space', 1, $3)"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .bind(node_id)
+    .bind(activation_attempt_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    fixture.substrate.delete_execution(sandbox_id).await?;
+
+    assert!(
+        state.get(&sandbox_id.to_string()).await.is_err(),
+        "create rollback must delete a direct execution before active_node_id is committed"
+    );
+    drop(server);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn direct_create_rejects_node_pool_placement() -> TestResult {
     let Some(fixture) = postgres_fixture().await? else {
         return Ok(());
@@ -863,6 +907,29 @@ async fn insert_sandbox(
     ))
     .bind(sandbox_id)
     .bind(source_node_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Seed the bare `nodes` row the termination fence requires.
+///
+/// The fence refuses a placement whose destination has no `nodes` row at all
+/// (see `node_placement_fence`'s "A missing `nodes` row refuses"), and it runs
+/// before the lease and provenance checks. A test that names a destination node
+/// without creating one therefore gets a `RestoreInFlight` from the fence rather
+/// than from the thing it meant to exercise — which is invisible in a test that
+/// only asserts *that* an error occurred.
+///
+/// Lighter than [`insert_ready_worker`] on purpose: these callers need the row to
+/// exist, not the node to be schedulable, and seeding `node_direct` plus a status
+/// snapshot would imply the test depends on readiness when it does not.
+async fn insert_fenceable_node(pool: &PgPool, node_id: Uuid) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '127.0.0.1', 'worker', 'space', 'registered')"
+    ))
+    .bind(node_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -4075,6 +4142,12 @@ async fn stale_cross_node_restore_receipt_cannot_overwrite_newer_placement() -> 
     let stale_attempt_node_id = NodeId::new();
     let newer_attempt_node_id = NodeId::new();
     insert_sandbox(&fixture.pool, sandbox_id, Some(source_node_id)).await?;
+    // Both attempt nodes get rows so the rejection this test asserts is the
+    // expired-owner one it is named for. Without them the fence refuses first,
+    // for a missing node row, and raises the *same* `RestoreInFlight` variant —
+    // so the assertion below held while the lease check went unexercised.
+    insert_fenceable_node(&fixture.pool, stale_attempt_node_id.as_uuid()).await?;
+    insert_fenceable_node(&fixture.pool, newer_attempt_node_id.as_uuid()).await?;
 
     let stale_lease = fixture
         .substrate
@@ -4156,6 +4229,7 @@ async fn owned_restore_persists_the_supplied_identity_when_legacy_manager_omits_
     let source_node_id = NodeId::new();
     let destination_node_id = NodeId::new();
     insert_sandbox(&fixture.pool, sandbox_id, Some(source_node_id)).await?;
+    insert_fenceable_node(&fixture.pool, destination_node_id.as_uuid()).await?;
     let lease = fixture
         .substrate
         .claim_direct_restore_lease(sandbox_id)
@@ -4603,6 +4677,66 @@ async fn wake_keeps_generation_observed_during_resident_transition(
     assert_eq!(
         resumed.access_idle_policy,
         policy_to_proto(&policy).encode_to_vec()
+    );
+    Ok(())
+}
+
+/// An absent rollback receipt must be **confirmed** on the node, not assumed.
+///
+/// This pins the middle between two failures, which is why it asserts on *where*
+/// the call got to rather than on success or failure:
+///
+/// * Returning `Conflict` (the original behavior) made a retry after a successful
+///   teardown terminal — `controller_error_result` does not requeue it — stranding
+///   the row in `deleting` forever.
+/// * Returning `Ok(())` (the first attempt at fixing that) was worse. An absent
+///   receipt does not uniquely mean this teardown finished: `retire_execution`
+///   clears it after a stop, `suspend_execution` after a suspend, and
+///   `persist_route_identity_receipt` on a *successful* activation through an older
+///   sbx-mgr. In each the guest is still running, so reporting a completed teardown
+///   let the caller retire the `sandboxes` row and leak live on-node state with no
+///   control-plane row — the very thing this fence exists to prevent.
+///
+/// So the contract is: fall through to the delete RPC. The fixture registers no
+/// worker, so reaching node resolution is the observable proof it did. A `Conflict`
+/// here would mean the stranding is back; an `Ok` would mean absence was assumed.
+#[tokio::test(flavor = "current_thread")]
+async fn create_rollback_confirms_an_absent_receipt_against_the_node() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let node_id = NodeId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, Some(node_id)).await?;
+
+    let expected = SandboxRouteIdentity::try_new(
+        sandbox_id,
+        RouteGeneration::new(2)?,
+        node_id,
+        NodeManagedBy::Space,
+        ExecutionGeneration::try_from(2i64)?,
+        SandboxActivationAttemptId::from_uuid(Uuid::now_v7()),
+        None,
+    )?;
+    let fence = CreateRollbackExecutionFence::Direct {
+        node_id,
+        route_identity: Some(expected),
+    };
+
+    let error = fixture
+        .substrate
+        .delete_created_execution(sandbox_id, &fence)
+        .await
+        .expect_err("the fixture registers no worker, so the delete cannot complete");
+    assert!(
+        !matches!(error, SubstrateError::Conflict { .. }),
+        "an absent receipt must not be refused as a conflict — that is what made \
+         the retry terminal and stranded the row in `deleting`: {error}"
+    );
+    assert!(
+        error.to_string().contains("is not registered"),
+        "the call must reach node resolution, which is the proof it attempted the \
+         delete instead of assuming absence: {error}"
     );
     Ok(())
 }

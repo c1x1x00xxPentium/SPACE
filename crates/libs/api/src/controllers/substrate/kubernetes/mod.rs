@@ -69,9 +69,10 @@ pub use caches::K8sCaches;
 use cancel_rate_tracker::CancelRateTracker;
 use restore_waiters::RestoreWaiters;
 use store::{
-    ActiveExecutionState, K8sStore, NodeLifecycleState, NodeStateWrite, PlacementClock,
-    PreparedWakeSandbox, RestoreClaim, SandboxExecutionRow, StartedRecoveryClaim,
-    StartedRecoveryCompletion, StartedRecoveryObservation, UserRestoreObservation,
+    ActiveExecutionState, CancelledCreateCleanupClaim, K8sStore, NodeLifecycleState,
+    NodeStateWrite, PlacementClock, PreparedWakeSandbox, RestoreClaim, SandboxExecutionRow,
+    StartedRecoveryClaim, StartedRecoveryCompletion, StartedRecoveryObservation,
+    UserRestoreObservation,
 };
 
 use crate::{
@@ -80,12 +81,13 @@ use crate::{
 
 use super::{
     ActivationCompletion, ActivationOptions, BuilderClient, CreateExecutionOutcome,
-    CreateExecutionRequest, ExecutionActivation, ExecutionActivityKind, ExecutionBinding,
-    ExecutionIdentity, ExecutionRoutabilityCheck, NODE_RPC_TIMEOUT, NodeApiTarget,
-    NodeInventoryEntry, ObservedPod, ObservedPodIdentity, OwnedNodeApiTarget, PodFenceMismatch,
-    PodIdentityFence, RecordedExecution, RetireExecutionOutcome, RetireExecutionRequest,
-    RetireFence, RuntimeClient, SubstrateAdapter, SubstrateCapabilities, SubstrateError,
-    TeardownProgress, WaitReadyTimeoutPhase, connect_worker, node_api_endpoint,
+    CreateExecutionRequest, CreateRollbackExecutionFence, ExecutionActivation,
+    ExecutionActivityKind, ExecutionBinding, ExecutionIdentity, ExecutionRoutabilityCheck,
+    NODE_RPC_TIMEOUT, NodeApiTarget, NodeInventoryEntry, ObservedPod, ObservedPodIdentity,
+    OwnedNodeApiTarget, PodFenceMismatch, PodIdentityFence, RecordedExecution,
+    RetireExecutionOutcome, RetireExecutionRequest, RetireFence, RuntimeClient, SubstrateAdapter,
+    SubstrateCapabilities, SubstrateError, TeardownProgress, WaitReadyTimeoutPhase, connect_worker,
+    node_api_endpoint,
 };
 
 const START_WAIT_FAST_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -686,11 +688,16 @@ async fn delete_sandbox_pod_if_uid(
     k8s: &KubernetesState,
     pod_name: &str,
     pod_uid: &PodUid,
-) -> Result<(), KubeError> {
+) -> Result<FencedPodDeleteOutcome, KubeError> {
     let pods: Api<Pod> = Api::namespaced(k8s.client.clone(), &k8s.sandbox_namespace);
     let params = pod_delete_params(pod_uid, None);
-    let _ = pods.delete(pod_name, &params).await?;
-    Ok(())
+    match pods.delete(pod_name, &params).await {
+        Ok(_) => Ok(FencedPodDeleteOutcome::Deleted),
+        Err(err) => match classify_fenced_pod_delete_error(&err) {
+            Some(outcome) => Ok(outcome),
+            None => Err(err),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

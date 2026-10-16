@@ -84,7 +84,7 @@ mod kubernetes_tests {
     };
 
     use sqlx::{PgPool, postgres::PgPoolOptions};
-    use tokio::sync::Semaphore;
+    use tokio::sync::{Notify, Semaphore};
     use tokio::task::JoinHandle;
     use tokio_util::sync::CancellationToken;
     use tonic::transport::{Server, server::TcpIncoming};
@@ -11366,6 +11366,364 @@ mod kubernetes_tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_guard_can_persist_cleanup_before_request_ownership_ends() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        let pod_uid = PodUid::parse("cancel-guard-awaited-claim-pod-uid")?;
+        let activation_attempt_id = SandboxActivationAttemptId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "creating").await?;
+        insert_k8s_execution(&pool, sandbox_id, 1, &pod_name, "", None, true).await?;
+        sqlx::query(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = $2
+              WHERE sandbox_id = $1 AND active",
+        )
+        .bind(sandbox_id)
+        .bind(activation_attempt_id)
+        .execute(&pool)
+        .await?;
+        let substrate = substrate_with_store_and_client(pool.clone(), inert_kubernetes_client());
+        let mut guard = CancelGuard::new(
+            sandbox_id,
+            pod_name,
+            1,
+            activation_attempt_id,
+            test_cancel_tracker(),
+            tokio_util::task::TaskTracker::new(),
+        );
+        guard.arm(
+            substrate.k8s.clone(),
+            substrate.store.clone(),
+            Some(pod_uid.clone()),
+        );
+
+        assert_eq!(
+            guard.establish_durable_cleanup().await?,
+            CancelledCreateCleanupClaim::DeleteClaimed
+        );
+        let lifecycle: String = sqlx::query_scalar("SELECT lifecycle FROM sandboxes WHERE id = $1")
+            .bind(sandbox_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(lifecycle, "deleting");
+        let stored_pod_uid: Option<String> = sqlx::query_scalar(
+            "SELECT NULLIF(BTRIM(pod_uid), '')
+               FROM sandbox_k8s_executions
+              WHERE sandbox_id = $1 AND active",
+        )
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stored_pod_uid.as_deref(), Some(pod_uid.as_str()));
+        guard.defuse();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_guard_keeps_tracking_until_uid_delete_succeeds() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        let pod_uid = PodUid::parse("cancel-guard-delete-failure-uid")?;
+        let activation_attempt_id = SandboxActivationAttemptId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "creating").await?;
+        insert_k8s_execution(
+            &pool,
+            sandbox_id,
+            1,
+            &pod_name,
+            pod_uid.as_str(),
+            None,
+            true,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = $2
+              WHERE sandbox_id = $1 AND active",
+        )
+        .bind(sandbox_id)
+        .bind(activation_attempt_id)
+        .execute(&pool)
+        .await?;
+
+        let delete_started = Arc::new(Notify::new());
+        let release_delete = Arc::new(Notify::new());
+        let service = tower::service_fn({
+            let delete_started = Arc::clone(&delete_started);
+            let release_delete = Arc::clone(&release_delete);
+            move |req: Request<Body>| {
+                let delete_started = Arc::clone(&delete_started);
+                let release_delete = Arc::clone(&release_delete);
+                async move {
+                    assert_eq!(req.method(), Method::DELETE);
+                    delete_started.notify_one();
+                    release_delete.notified().await;
+                    let body = serde_json::json!({
+                        "kind": "Status",
+                        "apiVersion": "v1",
+                        "status": "Failure",
+                        "reason": "InternalError",
+                        "code": 500
+                    });
+                    Ok::<_, BoxError>(
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&body)?))?,
+                    )
+                }
+            }
+        });
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            ClientBuilder::new(service, "space").build(),
+        );
+        let mut guard = CancelGuard::new(
+            sandbox_id,
+            pod_name,
+            1,
+            activation_attempt_id,
+            test_cancel_tracker(),
+            tokio_util::task::TaskTracker::new(),
+        );
+        guard.arm(
+            substrate.k8s.clone(),
+            substrate.store.clone(),
+            Some(pod_uid),
+        );
+        // The durable path: a create giving the sandbox up. An ordinary
+        // cancellation retires the claim instead, which
+        // `create_ending_early_gives_back_exactly_what_it_claimed` covers.
+        assert_eq!(
+            guard.establish_durable_cleanup().await?,
+            CancelledCreateCleanupClaim::DeleteClaimed
+        );
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(5), delete_started.notified()).await?;
+        let still_active: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM sandbox_k8s_executions
+                 WHERE sandbox_id = $1 AND active
+             )",
+        )
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        let lifecycle: String = sqlx::query_scalar("SELECT lifecycle FROM sandboxes WHERE id = $1")
+            .bind(sandbox_id)
+            .fetch_one(&pool)
+            .await?;
+        release_delete.notify_one();
+        assert!(
+            still_active,
+            "tracking must remain authoritative until Kubernetes accepts the UID-fenced delete"
+        );
+        assert_eq!(
+            lifecycle, "deleting",
+            "a failed cold-create cleanup needs durable intent for reconciler retry"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let still_active_after_error: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM sandbox_k8s_executions
+                 WHERE sandbox_id = $1 AND active
+             )",
+        )
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(
+            still_active_after_error,
+            "the apiserver error must leave exact execution ownership for the retry"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_guard_does_not_delete_an_execution_that_already_started() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        let pod_uid = PodUid::parse("cancel-guard-started-pod-uid")?;
+        let activation_attempt_id = SandboxActivationAttemptId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+        insert_k8s_execution(
+            &pool,
+            sandbox_id,
+            1,
+            &pod_name,
+            pod_uid.as_str(),
+            None,
+            true,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = $2
+              WHERE sandbox_id = $1 AND active",
+        )
+        .bind(sandbox_id)
+        .bind(activation_attempt_id)
+        .execute(&pool)
+        .await?;
+
+        let delete_attempted = Arc::new(Notify::new());
+        let service = tower::service_fn({
+            let delete_attempted = Arc::clone(&delete_attempted);
+            move |req: Request<Body>| {
+                let delete_attempted = Arc::clone(&delete_attempted);
+                async move {
+                    assert_eq!(req.method(), Method::DELETE);
+                    delete_attempted.notify_one();
+                    Ok::<_, BoxError>(Response::new(Body::empty()))
+                }
+            }
+        });
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            ClientBuilder::new(service, "space").build(),
+        );
+        let mut guard = CancelGuard::new(
+            sandbox_id,
+            pod_name,
+            1,
+            activation_attempt_id,
+            test_cancel_tracker(),
+            tokio_util::task::TaskTracker::new(),
+        );
+        guard.arm(
+            substrate.k8s.clone(),
+            substrate.store.clone(),
+            Some(pod_uid),
+        );
+        // The durable path: a create giving the sandbox up. An ordinary
+        // cancellation retires the claim instead, which
+        // `create_ending_early_gives_back_exactly_what_it_claimed` covers.
+        assert_eq!(
+            guard.establish_durable_cleanup().await?,
+            CancelledCreateCleanupClaim::NotOwned
+        );
+        drop(guard);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), delete_attempted.notified())
+                .await
+                .is_err(),
+            "a stale guard must not delete the pod after the same execution reached started"
+        );
+        let (lifecycle, active): (String, bool) = sqlx::query_as(
+            "SELECT s.lifecycle, e.active
+               FROM sandboxes s
+               JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
+              WHERE s.id = $1 AND e.generation = 1",
+        )
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(lifecycle, "started");
+        assert!(active);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_guard_still_deletes_a_fork_restores_own_pod() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        let pod_uid = PodUid::parse("cancel-guard-fork-restore-pod-uid")?;
+        let activation_attempt_id = SandboxActivationAttemptId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "restoring").await?;
+        insert_k8s_execution(
+            &pool,
+            sandbox_id,
+            1,
+            &pod_name,
+            pod_uid.as_str(),
+            None,
+            true,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = $2
+              WHERE sandbox_id = $1 AND active",
+        )
+        .bind(sandbox_id)
+        .bind(activation_attempt_id)
+        .execute(&pool)
+        .await?;
+
+        let delete_attempted = Arc::new(Notify::new());
+        let service = tower::service_fn({
+            let delete_attempted = Arc::clone(&delete_attempted);
+            move |req: Request<Body>| {
+                let delete_attempted = Arc::clone(&delete_attempted);
+                async move {
+                    assert_eq!(req.method(), Method::DELETE);
+                    delete_attempted.notify_one();
+                    Ok::<_, BoxError>(Response::new(Body::empty()))
+                }
+            }
+        });
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            ClientBuilder::new(service, "space").build(),
+        );
+        let mut guard = CancelGuard::new(
+            sandbox_id,
+            pod_name,
+            1,
+            activation_attempt_id,
+            test_cancel_tracker(),
+            tokio_util::task::TaskTracker::new(),
+        );
+        guard.arm(
+            substrate.k8s.clone(),
+            substrate.store.clone(),
+            Some(pod_uid),
+        );
+        // A placement failure asks for durable cleanup; on a fork restore the
+        // claim answers `NotCovered`.
+        assert_eq!(
+            guard.establish_durable_cleanup().await?,
+            CancelledCreateCleanupClaim::NotCovered
+        );
+        drop(guard);
+
+        // A fork restored as a new sandbox runs the same create path from
+        // `restoring`. The claim doesn't take it over, but the pod is still this
+        // create's: the guard retires the claim and deletes the pod, as it would
+        // with no claim at all, instead of leaving both running for a create that
+        // has already failed.
+        tokio::time::timeout(Duration::from_secs(5), delete_attempted.notified()).await?;
+        let mut active = true;
+        for _ in 0..100 {
+            active = sqlx::query_scalar(
+                "SELECT active FROM sandbox_k8s_executions
+                  WHERE sandbox_id = $1 AND generation = 1",
+            )
+            .bind(sandbox_id)
+            .fetch_one(&pool)
+            .await?;
+            if !active {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!active, "the fork restore's claim is retired with its pod");
         Ok(())
     }
 

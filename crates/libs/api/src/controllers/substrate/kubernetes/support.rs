@@ -1029,8 +1029,9 @@ pub(super) enum CancelCause {
     /// the K8s pod and the `pod_tracking` DB row is the orphaned-sandbox
     /// reconciler's `OrphanKind::Normal` path
     /// (`libs/cluster/controller/server/src/orphaned_sandboxes.rs`), which
-    /// fires for `lifecycle='creating'` rows whose pod is missing past
-    /// `CREATE_AGE_THRESHOLD_SECS`.
+    /// fires for `lifecycle='creating'` rows whose execution was last updated more
+    /// than `CREATE_AGE_THRESHOLD_SECS` ago and whose activation lease is absent or
+    /// expired, whether the pod is missing or still present.
     NodeMgrUnreachable,
 }
 
@@ -1062,6 +1063,17 @@ pub(super) struct CancelGuard {
     /// release or cleanup a dropped create leaves running.
     task_tracker: TaskTracker,
     cause: CancelCause,
+    /// Set by [`Self::establish_durable_cleanup`] once its claim is confirmed:
+    /// this create is giving the sandbox up, not just being cancelled. Only then
+    /// does the cleanup delete the row it marked `deleting`, after Kubernetes has
+    /// accepted the UID-fenced pod delete. An ordinary cancellation retires the
+    /// claim with its pod and leaves the `creating` row, so a retried create can
+    /// claim a new execution and converge.
+    durable_cleanup: bool,
+    /// Set when [`Self::establish_durable_cleanup`] found that the lifecycle or
+    /// the execution has moved on from this create: the cleanup then leaves the
+    /// pod and its tracking to their new owner.
+    ownership_lost: bool,
 }
 
 impl CancelGuard {
@@ -1085,6 +1097,8 @@ impl CancelGuard {
             cancel_tracker,
             task_tracker,
             cause: CancelCause::CallerDropped,
+            durable_cleanup: false,
+            ownership_lost: false,
         }
     }
 
@@ -1151,6 +1165,38 @@ impl CancelGuard {
         self.cause = cause;
     }
 
+    /// Establish the durable cold-create delete claim while the request still
+    /// owns an await point, for a create that is giving the sandbox up. `Drop`
+    /// then repeats the same idempotent claim before its pod delete and deletes
+    /// the never-succeeded row once that delete is accepted; a detached task is
+    /// not itself durable across process shutdown.
+    pub(super) async fn establish_durable_cleanup(
+        &mut self,
+    ) -> Result<CancelledCreateCleanupClaim, SubstrateError> {
+        let (Some(store), Some(pod_uid)) = (&self.store, &self.pod_uid) else {
+            return Ok(CancelledCreateCleanupClaim::NotOwned);
+        };
+        let claim = store
+            .mark_cancelled_create_cleanup_pending_if_attempt(
+                self.sandbox_id,
+                self.generation,
+                self.activation_attempt_id,
+                pod_uid,
+            )
+            .await;
+        // Only a confirmed claim makes the cleanup durable. `NotOwned` means the
+        // lifecycle or execution moved on (a joined attempt that reached
+        // `started`, or a row this claim doesn't cover), so the pod is someone
+        // else's to keep. An error leaves ownership unknown, and the ordinary
+        // claim retirement, fenced on generation and attempt, still applies.
+        match claim {
+            Ok(CancelledCreateCleanupClaim::DeleteClaimed) => self.durable_cleanup = true,
+            Ok(CancelledCreateCleanupClaim::NotOwned) => self.ownership_lost = true,
+            Ok(CancelledCreateCleanupClaim::NotCovered) | Err(_) => {}
+        }
+        claim
+    }
+
     pub(super) fn defuse(mut self) {
         self.k8s = None;
         self.store = None;
@@ -1211,10 +1257,20 @@ impl Drop for CancelGuard {
         let generation = self.generation;
         let activation_attempt_id = self.activation_attempt_id;
         let pod_uid = self.pod_uid.take();
+        let durable_cleanup = self.durable_cleanup;
 
         // Always record the cancel — both branches contribute to the
         // backpressure signal that gates new creates upstream.
         self.cancel_tracker.record_cancel();
+
+        if self.ownership_lost {
+            tracing::info!(
+                sandbox_id = %sandbox_id,
+                pod_name = %pod_name,
+                "create_execution cancelled after its ownership moved on — preserving the pod"
+            );
+            return;
+        }
 
         if matches!(self.cause, CancelCause::NodeMgrUnreachable) {
             // Node-mgr unreachable is exactly when *not* to spawn cleanup:
@@ -1254,6 +1310,127 @@ impl Drop for CancelGuard {
                     );
                     return;
                 };
+                if !durable_cleanup {
+                    // An ordinary cancellation: give back exactly what it
+                    // claimed. Retire the claim first, fenced on generation and
+                    // attempt, and delete the pod only if that retirement still
+                    // owned it — so a create that already started keeps its pod —
+                    // and leave the `creating` row for a retried create to claim.
+                    let retired = match store
+                        .forget_pod_tracking_if_generation_and_attempt(
+                            sandbox_id,
+                            generation,
+                            activation_attempt_id,
+                        )
+                        .await
+                    {
+                        Ok(retired) => retired,
+                        Err(err) => {
+                            tracing::error!(
+                                sandbox_id = %sandbox_id,
+                                pod_name = %pod_name,
+                                generation,
+                                error = %err,
+                                "cancel cleanup: failed to retire pod tracking"
+                            );
+                            return;
+                        }
+                    };
+                    if !retired {
+                        return;
+                    }
+                    match delete_sandbox_pod_if_uid(&k8s, &pod_name, &pod_uid).await {
+                        Ok(FencedPodDeleteOutcome::Deleted | FencedPodDeleteOutcome::NotFound) => {
+                            tracing::warn!(
+                                sandbox_id = %sandbox_id,
+                                pod_name = %pod_name,
+                                "cancel cleanup: UID-fenced sandbox pod delete accepted or already absent"
+                            );
+                        }
+                        Ok(FencedPodDeleteOutcome::PreconditionFailed) => {
+                            tracing::warn!(
+                                sandbox_id = %sandbox_id,
+                                pod_name = %pod_name,
+                                "cancel cleanup: UID precondition changed; the named pod is not this create's"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                sandbox_id = %sandbox_id,
+                                pod_name = %pod_name,
+                                error = %err,
+                                "cancel cleanup: failed to delete sandbox pod — pod may be orphaned"
+                            );
+                        }
+                    }
+                    return;
+                }
+                // A create giving the sandbox up (see `establish_durable_cleanup`):
+                // record durable delete intent, delete the pod, then retire its
+                // tracking and the never-succeeded row. The intent claim is what
+                // checks ownership here, which is why the pod delete can come
+                // before the retirement.
+                match store
+                    .mark_cancelled_create_cleanup_pending_if_attempt(
+                        sandbox_id,
+                        generation,
+                        activation_attempt_id,
+                        &pod_uid,
+                    )
+                    .await
+                {
+                    Ok(CancelledCreateCleanupClaim::DeleteClaimed) => tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        pod_name = %pod_name,
+                        "cancel cleanup: recorded durable cold-create delete intent"
+                    ),
+                    Ok(CancelledCreateCleanupClaim::NotOwned | CancelledCreateCleanupClaim::NotCovered) => {
+                        tracing::info!(
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            "cancel cleanup: lifecycle or execution ownership moved on; preserving the pod"
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            error = %err,
+                            "cancel cleanup: failed to record durable delete intent; retaining execution tracking"
+                        );
+                        return;
+                    }
+                }
+                match delete_sandbox_pod_if_uid(&k8s, &pod_name, &pod_uid).await {
+                    Ok(FencedPodDeleteOutcome::Deleted | FencedPodDeleteOutcome::NotFound) => {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            "cancel cleanup: UID-fenced sandbox pod delete accepted or already absent"
+                        );
+                    }
+                    Ok(FencedPodDeleteOutcome::PreconditionFailed) => {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            "cancel cleanup: UID precondition changed; retaining pod tracking for reconciliation"
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            error = %err,
+                            "cancel cleanup: failed to delete sandbox pod; retaining pod tracking for reconciliation"
+                        );
+                        return;
+                    }
+                }
+                // External deletion is durable before its only database
+                // address is retired. If this write fails, the still-active
+                // execution points reconciliation at an absent pod.
                 let retired = match store
                     .forget_pod_tracking_if_generation_and_attempt(
                         sandbox_id,
@@ -1269,7 +1446,7 @@ impl Drop for CancelGuard {
                             pod_name = %pod_name,
                             generation,
                             error = %err,
-                            "cancel cleanup: failed to retire pod tracking"
+                            "cancel cleanup: pod deleted but pod tracking retirement failed; leaving it for reconciliation"
                         );
                         return;
                     }
@@ -1277,20 +1454,32 @@ impl Drop for CancelGuard {
                 if !retired {
                     return;
                 }
-                match delete_sandbox_pod_if_uid(&k8s, &pod_name, &pod_uid).await {
-                    Ok(()) => {
-                        tracing::warn!(
+                match store
+                    .delete_cancelled_create_sandbox_if_cleaned(
+                        sandbox_id,
+                        generation,
+                        activation_attempt_id,
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::info!(
                             sandbox_id = %sandbox_id,
                             pod_name = %pod_name,
-                            "cancel cleanup: sandbox pod delete issued successfully"
+                            "cancel cleanup: deleted never-succeeded sandbox row"
                         );
                     }
+                    // Restore collisions, any successor execution, and a row
+                    // an earlier placement already attached to a node keep
+                    // their parent row; the last is collected later by the
+                    // orphaned-sandbox reconciler's `deleting` path.
+                    Ok(false) => {}
                     Err(err) => {
                         tracing::error!(
                             sandbox_id = %sandbox_id,
                             pod_name = %pod_name,
                             error = %err,
-                            "cancel cleanup: failed to delete sandbox pod — pod may be orphaned"
+                            "cancel cleanup: failed to delete never-succeeded sandbox row; leaving it for reconciliation"
                         );
                     }
                 }
